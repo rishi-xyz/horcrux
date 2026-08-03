@@ -50,7 +50,7 @@ literally run and show someone.
 
 ---
 
-## Phase 0 — Scaffolding (Days 1–3)
+## Phase 0 — Scaffolding [Done]
 
 **Build:** Rust workspace, `cargo` project skeleton, `horcrux` binary with stub
 subcommands (`init`, `sign`, `mpc-sign`), git repo, CI running `cargo test` +
@@ -63,7 +63,7 @@ CI check; you can hit the Sepolia RPC and get back a block number.
 
 ---
 
-## Phase 1 — SSS + Shard Crypto (Week 1)
+## Phase 1 — SSS + Shard Crypto (Week 1) [Done]
 
 **Build:** `horcrux init` — accept a raw secp256k1 private key (start with a disposable
 test key, never a real one), split into N shares via `vsss-rs` at a configurable
