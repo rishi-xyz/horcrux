@@ -7,6 +7,14 @@ pub mod error;
 pub mod shard;
 pub mod sss;
 
+use crate::error::Error;
+use crate::shard::{Shard, aad};
+use k256::elliptic_curve::ff::PrimeField;
+use k256::{Scalar, SecretKey};
+use std::fs;
+use std::path::{Path, PathBuf};
+use zeroize::{Zeroize, Zeroizing};
+
 pub const SHARD_MAGIC: &[u8; 3] = b"HX1";
 pub const SHARD_VERSION: u8 = 1;
 
@@ -25,3 +33,184 @@ pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
 /// Length of a share value, in bytes (a secp256k1 scalar).
 pub const SHARE_VALUE_LEN: usize = 32;
+
+/// Split a private key into `share_count` encrypted shard files written to
+/// `out_dir`, each bound to one of `passwords` (one guardian password per
+/// shard, in the same order).
+///
+/// Returns the paths of the written shard files.
+pub fn init_shards(
+    key: &SecretKey,
+    threshold: u8,
+    share_count: u8,
+    out_dir: &Path,
+    passwords: &[String],
+) -> Result<Vec<PathBuf>, Error> {
+    if threshold == 0 || threshold > share_count {
+        return Err(Error::InvalidParams(format!(
+            "threshold ({threshold}) must be between 1 and share count ({share_count})"
+        )));
+    }
+    if passwords.len() != share_count as usize {
+        return Err(Error::InvalidParams(format!(
+            "expected {share_count} passwords, got {}",
+            passwords.len()
+        )));
+    }
+
+    let shares = sss::split(key, threshold as usize, share_count as usize)?;
+    fs::create_dir_all(out_dir)?;
+
+    let mut paths = Vec::with_capacity(shares.len());
+    for (i, share) in shares.iter().enumerate() {
+        let id = share_id(share);
+        let salt = crypto::random_salt();
+        let nonce = crypto::random_nonce();
+        let aad = aad(threshold, share_count, id);
+
+        let mut value_bytes = Zeroizing::new(share.value.to_repr().to_vec());
+        let sealed = crypto::seal(&value_bytes, &passwords[i], &salt, &nonce, &aad)?;
+        value_bytes.zeroize();
+
+        let mut sealed_arr = [0u8; SHARE_VALUE_LEN + TAG_LEN];
+        sealed_arr.copy_from_slice(&sealed);
+
+        let shard = Shard::new(threshold, share_count, id, salt, nonce, sealed_arr);
+        let path = out_dir.join(format!("shard-{id}.hx"));
+        shard.write(&path)?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+/// Reconstruct a private key from shard files.
+///
+/// Each shard is decrypted with the guardian password at the corresponding
+/// position in `passwords`. All shards must come from the same split (same
+/// threshold and share count), and at least `threshold` of them must be
+/// supplied.
+///
+/// Note: the reconstructed [`SecretKey`] is returned for the caller to use
+/// and wipe; the intermediate share values are zeroized automatically.
+pub fn reconstruct(shard_paths: &[PathBuf], passwords: &[String]) -> Result<SecretKey, Error> {
+    if passwords.len() != shard_paths.len() {
+        return Err(Error::InvalidParams(format!(
+            "expected {} passwords, got {}",
+            shard_paths.len(),
+            passwords.len()
+        )));
+    }
+
+    let shards: Vec<Shard> = shard_paths
+        .iter()
+        .map(|p| Shard::read(p))
+        .collect::<Result<_, _>>()?;
+    if shards.is_empty() {
+        return Err(Error::InvalidParams("no shards provided".to_string()));
+    }
+
+    let threshold = shards[0].threshold;
+    let share_count = shards[0].share_count;
+    for (idx, shard) in shards.iter().enumerate() {
+        if shard.threshold != threshold || shard.share_count != share_count {
+            return Err(Error::SplitMismatch {
+                path: shard_paths[idx].clone(),
+                t: shard.threshold,
+                n: shard.share_count,
+            });
+        }
+    }
+    if shards.len() < threshold as usize {
+        return Err(Error::NotEnoughShares(threshold as usize, shards.len()));
+    }
+
+    let mut shares = Vec::with_capacity(shards.len());
+    for (shard, password) in shards.iter().zip(passwords) {
+        let value = shard.decrypt(password)?;
+        let value_bytes: [u8; SHARE_VALUE_LEN] = value
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::InvalidShardFile("decrypted share has wrong length".to_string()))?;
+        shares.push(build_share(shard.id, &value_bytes)?);
+    }
+    sss::combine(&shares)
+}
+
+/// Extract the share identifier (x-coordinate) as a `u8`.
+fn share_id(share: &sss::Share) -> u8 {
+    share.identifier.to_repr()[31]
+}
+
+/// Rebuild a `Share` from its identifier and 32-byte scalar value.
+fn build_share(id: u8, value_bytes: &[u8; SHARE_VALUE_LEN]) -> Result<sss::Share, Error> {
+    use vsss_rs::{IdentifierPrimeField, ValuePrimeField};
+
+    let value: Option<Scalar> = Scalar::from_repr((*value_bytes).into()).into();
+    let value = value.ok_or_else(|| Error::InvalidShardFile("invalid share value".to_string()))?;
+
+    Ok(sss::Share {
+        identifier: IdentifierPrimeField::from(Scalar::from(u64::from(id))),
+        value: ValuePrimeField::from(value),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k256::SecretKey;
+
+    #[test]
+    fn init_and_reconstruct_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = SecretKey::random(&mut rand::rngs::OsRng);
+        let passwords = ["one".to_string(), "two".to_string(), "three".to_string()];
+
+        let paths = init_shards(&key, 2, 3, dir.path(), &passwords).expect("init");
+        assert_eq!(paths.len(), 3);
+
+        let recovered =
+            reconstruct(&paths[..2].to_vec(), &passwords[..2].to_vec()).expect("reconstruct");
+        assert_eq!(recovered.to_bytes(), key.to_bytes());
+    }
+
+    #[test]
+    fn wrong_password_fails_cleanly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = SecretKey::random(&mut rand::rngs::OsRng);
+        let passwords = ["one".to_string(), "two".to_string(), "three".to_string()];
+        let paths = init_shards(&key, 2, 3, dir.path(), &passwords).expect("init");
+
+        let bad = ["nope".to_string(), "two".to_string()];
+        assert!(matches!(
+            reconstruct(&paths[..2].to_vec(), &bad),
+            Err(Error::Decrypt { .. })
+        ));
+    }
+
+    #[test]
+    fn too_few_shards_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = SecretKey::random(&mut rand::rngs::OsRng);
+        let passwords = ["one".to_string(), "two".to_string(), "three".to_string()];
+        let paths = init_shards(&key, 2, 3, dir.path(), &passwords).expect("init");
+
+        assert!(matches!(
+            reconstruct(&paths[..1].to_vec(), &passwords[..1].to_vec()),
+            Err(Error::NotEnoughShares(..))
+        ));
+    }
+
+    #[test]
+    fn shards_from_different_splits_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = SecretKey::random(&mut rand::rngs::OsRng);
+        let passwords = ["one".to_string(), "two".to_string(), "three".to_string()];
+
+        let set_a = init_shards(&key, 2, 3, dir.path(), &passwords).expect("init a");
+        let set_b = init_shards(&key, 3, 3, dir.path(), &passwords).expect("init b");
+
+        let mut mixed = vec![set_a[0].clone(), set_b[0].clone()];
+        assert!(reconstruct(&mut mixed, &passwords[..2].to_vec()).is_err());
+    }
+}
+
