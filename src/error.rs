@@ -20,6 +20,14 @@ pub enum Error {
     #[error("failed to decrypt shard {id}: {reason}")]
     Decrypt { id: u8, reason: String },
 
+    /// Password-based key derivation failed.
+    #[error("key derivation failed: {0}")]
+    Kdf(String),
+
+    /// Authenticated encryption failed.
+    #[error("authenticated encryption failed: {0}")]
+    Aead(String),
+
     /// The shard file is not a valid horcrux shard.
     #[error("invalid shard file: {0}")]
     InvalidShardFile(String),
