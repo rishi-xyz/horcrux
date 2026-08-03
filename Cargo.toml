@@ -2,7 +2,7 @@
 name = "horcrux"
 version = "0.1.0"
 edition = "2024"
-description = "Shamir's Secret Sharing split, encrypted shard storage, and key reconstruction for EVM signing."
+description = "Offline Threshold Key Management System for Blockchain Private Keys"
 license = "MIT"
 
 [dependencies]

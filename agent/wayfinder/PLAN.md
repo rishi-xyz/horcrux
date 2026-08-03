@@ -1,5 +1,5 @@
 # HORCRUX — Build Plan
-### Final-year major project · 8-week timeline · solo build w/ AI coding agent assist
+### Final-year major project · 8-week timeline 
 
 ---
 
