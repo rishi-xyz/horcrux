@@ -1,7 +1,7 @@
 use crate::error::Error;
 use crate::{ARGON2_M_COST, ARGON2_P_COST, ARGON2_T_COST, NONCE_LEN, SALT_LEN};
 use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -55,9 +55,9 @@ pub fn seal(
     aad: &[u8],
 ) -> Result<Vec<u8>, Error> {
     let key = derive_key(password, salt)?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key[..]));
+    let cipher = Aes256Gcm::new(&(*key).into());
     cipher
-        .encrypt(Nonce::from_slice(nonce), Payload { msg: plaintext, aad })
+        .encrypt(&Nonce::from(*nonce), Payload { msg: plaintext, aad })
         .map_err(|e| Error::Aead(format!("encryption failed: {e}")))
 }
 
@@ -73,9 +73,9 @@ pub fn open(
     aad: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, Error> {
     let key = derive_key(password, salt)?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key[..]));
+    let cipher = Aes256Gcm::new(&(*key).into());
     let plain = cipher
-        .decrypt(Nonce::from_slice(nonce), Payload { msg: ciphertext, aad })
+        .decrypt(&Nonce::from(*nonce), Payload { msg: ciphertext, aad })
         .map_err(|_| Error::Aead("wrong password or tampered shard".to_string()))?;
     Ok(Zeroizing::new(plain))
 }

@@ -4,6 +4,7 @@
 
 pub mod crypto;
 pub mod error;
+pub mod shard;
 pub mod sss;
 
 pub const SHARD_MAGIC: &[u8; 3] = b"HX1";
