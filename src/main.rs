@@ -81,7 +81,12 @@ fn main() -> anyhow::Result<()> {
             )?;
 
             let paths = init_shards(&key, threshold, shares, &out_dir, &passwords)?;
-            println!("Wrote {n} shards to {dir} (threshold {t}):", n = paths.len(), dir = out_dir.display(), t = threshold);
+            println!(
+                "Wrote {n} shards to {dir} (threshold {t}):",
+                n = paths.len(),
+                dir = out_dir.display(),
+                t = threshold
+            );
             for path in &paths {
                 println!("  {}", path.display());
             }
@@ -91,7 +96,10 @@ fn main() -> anyhow::Result<()> {
                 shards.len(),
                 password,
                 &|i, _| {
-                    let name = shards[i].file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let name = shards[i]
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
                     format!("Password for {name}: ")
                 },
                 false,
@@ -108,8 +116,8 @@ fn main() -> anyhow::Result<()> {
 /// prefix.
 fn parse_key(hex_key: &str) -> Result<SecretKey, Error> {
     let stripped = hex_key.strip_prefix("0x").unwrap_or(hex_key);
-    let bytes = hex::decode(stripped)
-        .map_err(|e| Error::InvalidKey(format!("not valid hex: {e}")))?;
+    let bytes =
+        hex::decode(stripped).map_err(|e| Error::InvalidKey(format!("not valid hex: {e}")))?;
     if bytes.len() != 32 {
         return Err(Error::InvalidKey(format!(
             "expected 32 bytes, got {}",

@@ -3,9 +3,7 @@
 //! fails cleanly.
 
 use horcrux::error::Error;
-use horcrux::{
-    SHARE_VALUE_LEN, TAG_LEN, init_shards, reconstruct,
-};
+use horcrux::{SHARE_VALUE_LEN, TAG_LEN, init_shards, reconstruct};
 use k256::SecretKey;
 use rand::rngs::OsRng;
 
@@ -26,11 +24,7 @@ fn round_trip_any_two_of_three() {
     let paths = init_shards(&key, 2, 3, dir.path(), &pws).expect("init");
     assert_eq!(paths.len(), 3);
 
-    for combo in [
-        &[0usize, 1],
-        &[0usize, 2],
-        &[1usize, 2],
-    ] {
+    for combo in [&[0usize, 1], &[0usize, 2], &[1usize, 2]] {
         let chosen: Vec<_> = combo.iter().map(|&i| paths[i].clone()).collect();
         let pws: Vec<_> = combo.iter().map(|&i| pws[i].clone()).collect();
         let recovered = reconstruct(&chosen, &pws).expect("reconstruct");
@@ -47,7 +41,7 @@ fn round_trip_three_of_five() {
     let paths = init_shards(&key, 3, 5, dir.path(), &pws).expect("init");
     assert_eq!(paths.len(), 5);
 
-    let recovered = reconstruct(&paths[..3].to_vec(), &pws[..3].to_vec()).expect("reconstruct");
+    let recovered = reconstruct(&paths[..3], &pws[..3]).expect("reconstruct");
     assert_eq!(recovered.to_bytes(), key.to_bytes());
 }
 
@@ -60,7 +54,12 @@ fn shards_are_binary_files_of_expected_size() {
     let expected = 7 + 16 + 12 + SHARE_VALUE_LEN + TAG_LEN;
     for path in &paths {
         let bytes = std::fs::read(path).expect("read");
-        assert_eq!(bytes.len(), expected, "unexpected shard size for {}", path.display());
+        assert_eq!(
+            bytes.len(),
+            expected,
+            "unexpected shard size for {}",
+            path.display()
+        );
         assert_eq!(&bytes[..3], b"HX1");
     }
 }
@@ -74,7 +73,7 @@ fn wrong_password_fails_with_decrypt_error() {
 
     let bad = vec!["wrong".to_string(), pws[1].clone()];
     assert!(matches!(
-        reconstruct(&paths[..2].to_vec(), &bad),
+        reconstruct(&paths[..2], &bad),
         Err(Error::Decrypt { .. })
     ));
 }
@@ -92,7 +91,7 @@ fn tampered_shard_fails_to_decrypt() {
     std::fs::write(&paths[0], bytes).expect("rewrite");
 
     assert!(matches!(
-        reconstruct(&paths[..2].to_vec(), &pws[..2].to_vec()),
+        reconstruct(&paths[..2], &pws[..2]),
         Err(Error::Decrypt { .. })
     ));
 }
@@ -105,7 +104,7 @@ fn too_few_shards_fails() {
     let paths = init_shards(&key, 2, 3, dir.path(), &pws).expect("init");
 
     assert!(matches!(
-        reconstruct(&paths[..1].to_vec(), &pws[..1].to_vec()),
+        reconstruct(&paths[..1], &pws[..1]),
         Err(Error::NotEnoughShares(2, 1))
     ));
 }
@@ -132,7 +131,7 @@ fn password_count_must_match_shard_count() {
     let paths = init_shards(&key, 2, 3, dir.path(), &pws).expect("init");
 
     assert!(matches!(
-        reconstruct(&paths[..2].to_vec(), &pws[..1].to_vec()),
+        reconstruct(&paths[..2], &pws[..1]),
         Err(Error::InvalidParams(_))
     ));
 }

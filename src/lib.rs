@@ -168,8 +168,7 @@ mod tests {
         let paths = init_shards(&key, 2, 3, dir.path(), &passwords).expect("init");
         assert_eq!(paths.len(), 3);
 
-        let recovered =
-            reconstruct(&paths[..2].to_vec(), &passwords[..2].to_vec()).expect("reconstruct");
+        let recovered = reconstruct(&paths[..2], &passwords[..2]).expect("reconstruct");
         assert_eq!(recovered.to_bytes(), key.to_bytes());
     }
 
@@ -182,7 +181,7 @@ mod tests {
 
         let bad = ["nope".to_string(), "two".to_string()];
         assert!(matches!(
-            reconstruct(&paths[..2].to_vec(), &bad),
+            reconstruct(&paths[..2], &bad),
             Err(Error::Decrypt { .. })
         ));
     }
@@ -195,7 +194,7 @@ mod tests {
         let paths = init_shards(&key, 2, 3, dir.path(), &passwords).expect("init");
 
         assert!(matches!(
-            reconstruct(&paths[..1].to_vec(), &passwords[..1].to_vec()),
+            reconstruct(&paths[..1], &passwords[..1]),
             Err(Error::NotEnoughShares(..))
         ));
     }
@@ -209,8 +208,7 @@ mod tests {
         let set_a = init_shards(&key, 2, 3, dir.path(), &passwords).expect("init a");
         let set_b = init_shards(&key, 3, 3, dir.path(), &passwords).expect("init b");
 
-        let mut mixed = vec![set_a[0].clone(), set_b[0].clone()];
-        assert!(reconstruct(&mut mixed, &passwords[..2].to_vec()).is_err());
+        let mixed = vec![set_a[0].clone(), set_b[0].clone()];
+        assert!(reconstruct(&mixed, &passwords[..2]).is_err());
     }
 }
-

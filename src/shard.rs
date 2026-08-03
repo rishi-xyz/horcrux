@@ -1,8 +1,6 @@
 use crate::crypto;
 use crate::error::Error;
-use crate::{
-    NONCE_LEN, SALT_LEN, SHARD_MAGIC, SHARE_VALUE_LEN, SHARD_VERSION, TAG_LEN,
-};
+use crate::{NONCE_LEN, SALT_LEN, SHARD_MAGIC, SHARD_VERSION, SHARE_VALUE_LEN, TAG_LEN};
 use std::fs;
 use std::path::Path;
 use zeroize::Zeroizing;
@@ -133,12 +131,12 @@ impl Shard {
     /// password (or tampered file) is rejected by the GCM tag check.
     pub fn decrypt(&self, password: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
         let aad = aad(self.threshold, self.share_count, self.id);
-        crypto::open(&self.sealed, password, &self.salt, &self.nonce, &aad).map_err(
-            |e| Error::Decrypt {
+        crypto::open(&self.sealed, password, &self.salt, &self.nonce, &aad).map_err(|e| {
+            Error::Decrypt {
                 id: self.id,
                 reason: e.to_string(),
-            },
-        )
+            }
+        })
     }
 }
 

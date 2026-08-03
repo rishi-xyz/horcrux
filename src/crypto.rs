@@ -3,8 +3,8 @@ use crate::{ARGON2_M_COST, ARGON2_P_COST, ARGON2_T_COST, NONCE_LEN, SALT_LEN};
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
-use rand::rngs::OsRng;
 use rand::RngCore;
+use rand::rngs::OsRng;
 use zeroize::Zeroizing;
 
 const KEY_LEN: usize = 32;
@@ -27,14 +27,12 @@ pub fn random_nonce() -> [u8; NONCE_LEN] {
 ///
 /// Parameters follow the OWASP "interactive login" recommendation
 /// (m=19 MiB, t=2, p=1).
-pub fn derive_key(password: &str, salt: &[u8; SALT_LEN]) -> Result<Zeroizing<[u8; KEY_LEN]>, Error> {
-    let params = Params::new(
-        ARGON2_M_COST,
-        ARGON2_T_COST,
-        ARGON2_P_COST,
-        Some(KEY_LEN),
-    )
-    .map_err(|e| Error::Kdf(format!("invalid Argon2 parameters: {e}")))?;
+pub fn derive_key(
+    password: &str,
+    salt: &[u8; SALT_LEN],
+) -> Result<Zeroizing<[u8; KEY_LEN]>, Error> {
+    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(KEY_LEN))
+        .map_err(|e| Error::Kdf(format!("invalid Argon2 parameters: {e}")))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
     let mut key = Zeroizing::new([0u8; KEY_LEN]);
@@ -57,7 +55,13 @@ pub fn seal(
     let key = derive_key(password, salt)?;
     let cipher = Aes256Gcm::new(&(*key).into());
     cipher
-        .encrypt(&Nonce::from(*nonce), Payload { msg: plaintext, aad })
+        .encrypt(
+            &Nonce::from(*nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|e| Error::Aead(format!("encryption failed: {e}")))
 }
 
@@ -75,7 +79,13 @@ pub fn open(
     let key = derive_key(password, salt)?;
     let cipher = Aes256Gcm::new(&(*key).into());
     let plain = cipher
-        .decrypt(&Nonce::from(*nonce), Payload { msg: ciphertext, aad })
+        .decrypt(
+            &Nonce::from(*nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| Error::Aead("wrong password or tampered shard".to_string()))?;
     Ok(Zeroizing::new(plain))
 }
@@ -145,8 +155,14 @@ mod tests {
         let ct_a = seal(&a, "alpha", &salt_a, &nonce_a, b"").expect("seal a");
         let ct_b = seal(&b, "beta", &salt_b, &nonce_b, b"").expect("seal b");
 
-        assert_eq!(&open(&ct_a, "alpha", &salt_a, &nonce_a, b"").unwrap()[..], &a[..]);
-        assert_eq!(&open(&ct_b, "beta", &salt_b, &nonce_b, b"").unwrap()[..], &b[..]);
+        assert_eq!(
+            &open(&ct_a, "alpha", &salt_a, &nonce_a, b"").unwrap()[..],
+            &a[..]
+        );
+        assert_eq!(
+            &open(&ct_b, "beta", &salt_b, &nonce_b, b"").unwrap()[..],
+            &b[..]
+        );
         assert!(open(&ct_a, "beta", &salt_a, &nonce_a, b"").is_err());
         assert!(open(&ct_b, "alpha", &salt_b, &nonce_b, b"").is_err());
     }

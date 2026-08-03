@@ -29,9 +29,8 @@ pub fn split(secret: &SecretKey, threshold: usize, limit: usize) -> Result<Vec<S
     }
 
     let secret = IdentifierPrimeField(*secret.to_nonzero_scalar().as_ref());
-    shamir::split_secret::<Share>(threshold, limit, &secret, &mut OsRng).map_err(|e| {
-        Error::Vsss(format!("could not split secret: {e}"))
-    })
+    shamir::split_secret::<Share>(threshold, limit, &secret, &mut OsRng)
+        .map_err(|e| Error::Vsss(format!("could not split secret: {e}")))
 }
 
 /// Reconstruct a private key from a set of shares via Lagrange interpolation.
@@ -43,9 +42,10 @@ pub fn combine(shares: &[Share]) -> Result<SecretKey, Error> {
     if shares.len() < 2 {
         return Err(Error::NotEnoughShares(2, shares.len()));
     }
-    let recovered = shares.to_vec().combine().map_err(|e| {
-        Error::Vsss(format!("could not combine shares: {e}"))
-    })?;
+    let recovered = shares
+        .to_vec()
+        .combine()
+        .map_err(|e| Error::Vsss(format!("could not combine shares: {e}")))?;
     let scalar: &Scalar = recovered.as_ref();
     let ct: Option<NonZeroScalar> = NonZeroScalar::from_repr(scalar.to_repr()).into();
     let nz = ct.ok_or_else(|| Error::Vsss("reconstructed key is zero".to_string()))?;
@@ -67,9 +67,9 @@ mod tests {
         assert_eq!(shares.len(), 3);
 
         for combo in [
-            &[shares[0].clone(), shares[1].clone()],
-            &[shares[0].clone(), shares[2].clone()],
-            &[shares[1].clone(), shares[2].clone()],
+            &[shares[0], shares[1]],
+            &[shares[0], shares[2]],
+            &[shares[1], shares[2]],
         ] {
             let recovered = combine(combo).expect("combine");
             assert_eq!(recovered.to_bytes(), key.to_bytes());
@@ -100,25 +100,16 @@ mod tests {
     #[test]
     fn invalid_params_rejected() {
         let key = random_key();
-        assert!(matches!(
-            split(&key, 0, 3),
-            Err(Error::InvalidParams(_))
-        ));
-        assert!(matches!(
-            split(&key, 3, 2),
-            Err(Error::InvalidParams(_))
-        ));
-        assert!(matches!(
-            split(&key, 2, 256),
-            Err(Error::InvalidParams(_))
-        ));
+        assert!(matches!(split(&key, 0, 3), Err(Error::InvalidParams(_))));
+        assert!(matches!(split(&key, 3, 2), Err(Error::InvalidParams(_))));
+        assert!(matches!(split(&key, 2, 256), Err(Error::InvalidParams(_))));
     }
 
     #[test]
     fn duplicate_share_rejected() {
         let key = random_key();
         let shares = split(&key, 2, 3).expect("split");
-        let dup = [shares[0].clone(), shares[0]];
+        let dup = [shares[0], shares[0]];
         assert!(combine(&dup).is_err());
     }
 }
