@@ -2,6 +2,8 @@
 //! the shares with per-shard guardian passwords (Argon2id + AES-256-GCM), and
 //! reconstruct the key from any threshold subset of shard files.
 
+pub mod error;
+
 pub const SHARD_MAGIC: &[u8; 3] = b"HX1";
 pub const SHARD_VERSION: u8 = 1;
 
