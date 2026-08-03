@@ -3,6 +3,7 @@
 //! reconstruct the key from any threshold subset of shard files.
 
 pub mod error;
+pub mod sss;
 
 pub const SHARD_MAGIC: &[u8; 3] = b"HX1";
 pub const SHARD_VERSION: u8 = 1;
