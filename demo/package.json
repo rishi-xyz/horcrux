@@ -1,0 +1,21 @@
+{
+  "name": "horcrux-demo-video",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Remotion video of the horcrux Phase 1 demo",
+  "scripts": {
+    "studio": "remotion studio",
+    "render": "remotion render horcrux-demo out/horcrux-phase1.mp4"
+  },
+  "dependencies": {
+    "@remotion/cli": "^4.0.505",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "remotion": "^4.0.505"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "typescript": "^7.0.2"
+  }
+}
