@@ -22,4 +22,5 @@ vsss-rs = "5.4.0"
 zeroize = "1.8"
 
 [dev-dependencies]
+serde_json = "1"
 tempfile = "3"

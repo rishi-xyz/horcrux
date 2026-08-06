@@ -2244,6 +2244,7 @@ dependencies = [
  "k256",
  "rand 0.8.7",
  "rpassword",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

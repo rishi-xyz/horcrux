@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use horcrux::error::Error;
 use horcrux::tx::{DEFAULT_CHAIN_ID, Fee, TxParams};
-use horcrux::{init_shards, reconstruct, sign_transaction_from_shards};
+use horcrux::{init_shards, reconstruct};
 use k256::SecretKey;
 use rand::rngs::OsRng;
 use std::path::PathBuf;
@@ -18,6 +18,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // clap subcommand variants are inherently large
 enum Command {
     /// Split a private key into encrypted shard files.
     Init {
@@ -49,7 +50,8 @@ enum Command {
         #[arg(long)]
         password: Option<String>,
     },
-    /// Sign an EVM transaction offline with a key reconstructed from shards.
+    /// Sign an EVM transaction offline with a key reconstructed from shards,
+    /// optionally filling missing fields from and broadcasting to an EVM RPC.
     Sign {
         /// Paths of the shard files to combine.
         #[arg(required = true)]
@@ -66,28 +68,39 @@ enum Command {
         /// Calldata as hex (0x-prefixed).
         #[arg(long, default_value = "0x")]
         data: String,
-        /// Chain id for EIP-155 replay protection.
-        #[arg(long, default_value_t = DEFAULT_CHAIN_ID)]
-        chain_id: u64,
-        /// Account nonce of the sender.
+        /// Chain id for EIP-155 replay protection (defaults to 11155111
+        /// offline, or the node's chain id when broadcasting).
         #[arg(long)]
-        nonce: u64,
-        /// Gas limit.
+        chain_id: Option<u64>,
+        /// Account nonce of the sender. Required offline; fetched from the RPC
+        /// when broadcasting.
         #[arg(long)]
-        gas: u64,
+        nonce: Option<u64>,
+        /// Gas limit. Required offline; estimated via the RPC when
+        /// broadcasting.
+        #[arg(long)]
+        gas: Option<u64>,
         /// Legacy gas price in wei (makes the transaction legacy-typed).
         #[arg(long, conflicts_with_all = ["max_fee_per_gas", "max_priority_fee_per_gas"])]
         gas_price: Option<u128>,
-        /// EIP-1559 max fee per gas in wei.
-        #[arg(long, required_unless_present = "gas_price")]
+        /// EIP-1559 max fee per gas in wei. Required offline; estimated when
+        /// broadcasting.
+        #[arg(long)]
         max_fee_per_gas: Option<u128>,
         /// EIP-1559 max priority fee per gas in wei.
         #[arg(long, requires = "max_fee_per_gas")]
         max_priority_fee_per_gas: Option<u128>,
+        /// EVM JSON-RPC endpoint (overrides $HORCRUX_RPC_URL).
+        #[arg(long)]
+        rpc_url: Option<String>,
+        /// Broadcast the signed transaction and wait for its receipt.
+        #[arg(long)]
+        broadcast: bool,
     },
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init {
@@ -157,6 +170,8 @@ fn main() -> anyhow::Result<()> {
             gas_price,
             max_fee_per_gas,
             max_priority_fee_per_gas,
+            rpc_url,
+            broadcast,
         } => {
             let passwords = collect_passwords(
                 shards.len(),
@@ -179,27 +194,117 @@ fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("invalid --value: {e}"))?;
             let data = parse_data(&data)?;
 
-            let fee = match gas_price {
-                Some(gas_price) => Fee::Legacy { gas_price },
-                None => Fee::Eip1559 {
-                    max_fee_per_gas: max_fee_per_gas.unwrap(),
-                    max_priority_fee_per_gas: max_priority_fee_per_gas.unwrap(),
-                },
-            };
-            let params = TxParams {
-                to,
-                value,
-                data,
-                chain_id,
-                nonce,
-                gas_limit: gas,
-                fee,
+            let explicit_fee = match (gas_price, max_fee_per_gas, max_priority_fee_per_gas) {
+                (Some(gas_price), None, None) => Some(Fee::Legacy { gas_price }),
+                (None, Some(max_fee_per_gas), Some(max_priority_fee_per_gas)) => {
+                    Some(Fee::Eip1559 {
+                        max_fee_per_gas,
+                        max_priority_fee_per_gas,
+                    })
+                }
+                (None, None, None) => None,
+                _ => unreachable!("clap conflicts prevent a mixed fee model"),
             };
 
-            let out = sign_transaction_from_shards(&shards, &passwords, params)?;
-            println!("From:    {:#x}", out.from);
-            println!("Tx hash: {:#x}", out.tx_hash);
-            println!("Raw:     {}", out.raw_hex);
+            let rpc_url = rpc_url.unwrap_or_else(horcrux::chain::default_rpc_url);
+            let key = reconstruct(&shards, &passwords)?;
+            let from = horcrux::tx::derive_address(&key);
+
+            let params;
+            let provider;
+            if broadcast {
+                let connected = horcrux::chain::http_provider(&rpc_url).await?;
+                println!("Broadcasting via {rpc_url}");
+                let populated = horcrux::chain::populate(
+                    &connected,
+                    from,
+                    to,
+                    value,
+                    data.clone(),
+                    horcrux::chain::FieldHints {
+                        chain_id,
+                        nonce,
+                        gas_limit: gas,
+                        fee: explicit_fee,
+                    },
+                )
+                .await?;
+                println!(
+                    "Resolved: chain {} · nonce {} · gas {} · {}",
+                    populated.chain_id,
+                    populated.nonce,
+                    populated.gas_limit,
+                    match populated.fee {
+                        Fee::Legacy { gas_price } => format!("legacy {gas_price} wei/gas"),
+                        Fee::Eip1559 {
+                            max_fee_per_gas,
+                            max_priority_fee_per_gas,
+                        } => format!(
+                            "EIP-1559 max {max_fee_per_gas} + tip {max_priority_fee_per_gas} wei/gas"
+                        ),
+                    },
+                );
+                params = TxParams {
+                    to,
+                    value,
+                    data,
+                    chain_id: populated.chain_id,
+                    nonce: populated.nonce,
+                    gas_limit: populated.gas_limit,
+                    fee: populated.fee,
+                };
+                provider = Some(connected);
+            } else {
+                let chain_id = chain_id.unwrap_or(DEFAULT_CHAIN_ID);
+                let nonce = nonce.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "offline signing requires --nonce; use --broadcast to fetch it from the RPC"
+                    )
+                })?;
+                let gas_limit = gas.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "offline signing requires --gas; use --broadcast to estimate it from the RPC"
+                    )
+                })?;
+                let fee = explicit_fee.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "offline signing requires a fee model \
+                         (--gas-price, or --max-fee-per-gas with --max-priority-fee-per-gas); \
+                         use --broadcast to estimate one"
+                    )
+                })?;
+                params = TxParams {
+                    to,
+                    value,
+                    data,
+                    chain_id,
+                    nonce,
+                    gas_limit,
+                    fee,
+                };
+                provider = None;
+            }
+
+            let signed = horcrux::tx::sign_transaction(key, params)?;
+            println!("From:    {:#x}", signed.from());
+            println!("Tx hash: {:#x}", signed.tx_hash());
+            println!("Raw:     {}", signed.raw_hex());
+
+            if let Some(provider) = provider {
+                let (tx_hash, receipt) = horcrux::chain::broadcast(
+                    &provider,
+                    &signed.encoded(),
+                    std::time::Duration::from_secs(2),
+                    60,
+                )
+                .await?;
+                let status = if receipt.inner.status() {
+                    "success"
+                } else {
+                    "reverted"
+                };
+                println!("Mined:   {tx_hash:#x} ({status})");
+            }
         }
     }
     Ok(())

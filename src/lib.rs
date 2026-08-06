@@ -2,6 +2,7 @@
 //! the shares with per-shard guardian passwords (Argon2id + AES-256-GCM), and
 //! reconstruct the key from any threshold subset of shard files.
 
+pub mod chain;
 pub mod crypto;
 pub mod error;
 pub mod shard;
