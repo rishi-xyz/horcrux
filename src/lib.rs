@@ -10,6 +10,7 @@ pub mod tx;
 
 use crate::error::Error;
 use crate::shard::{Shard, aad};
+use crate::tx::{SignedTx, TxParams};
 use k256::elliptic_curve::ff::PrimeField;
 use k256::{Scalar, SecretKey};
 use std::fs;
@@ -135,6 +136,42 @@ pub fn reconstruct(shard_paths: &[PathBuf], passwords: &[String]) -> Result<Secr
         shares.push(build_share(shard.id, &value_bytes)?);
     }
     sss::combine(&shares)
+}
+
+/// A signed transaction plus the metadata needed to broadcast or verify it.
+#[derive(Debug, Clone)]
+pub struct SignedOutput {
+    /// Sender address (derived from the reconstructed key).
+    pub from: alloy::primitives::Address,
+    /// Transaction hash (keccak of the EIP-2718 encoding).
+    pub tx_hash: alloy::primitives::B256,
+    /// Raw EIP-2718 encoding as a `0x`-prefixed hex string.
+    pub raw_hex: String,
+}
+
+impl From<SignedTx> for SignedOutput {
+    fn from(signed: SignedTx) -> Self {
+        Self {
+            from: signed.from(),
+            tx_hash: signed.tx_hash(),
+            raw_hex: signed.raw_hex(),
+        }
+    }
+}
+
+/// Reconstruct the key from shards and sign a transaction entirely offline
+/// (Mode A).
+///
+/// The reconstructed key is moved straight into the signing context and
+/// zeroized on drop; it never leaves memory in the clear.
+pub fn sign_transaction_from_shards(
+    shard_paths: &[PathBuf],
+    passwords: &[String],
+    params: TxParams,
+) -> Result<SignedOutput, Error> {
+    let key = reconstruct(shard_paths, passwords)?;
+    let signed = tx::sign_transaction(key, params)?;
+    Ok(signed.into())
 }
 
 /// Extract the share identifier (x-coordinate) as a `u8`.
