@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod error;
 pub mod shard;
 pub mod sss;
+pub mod tx;
 
 use crate::error::Error;
 use crate::shard::{Shard, aad};

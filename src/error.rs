@@ -43,4 +43,8 @@ pub enum Error {
     /// I/O error while reading or writing a shard file.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Failed to build, sign, or encode an EVM transaction.
+    #[error("transaction error: {0}")]
+    Tx(String),
 }
