@@ -705,17 +705,47 @@ Destroy Original Key
 
 ## Sign
 
-Mode A signing.
+Mode A signing: decrypt a threshold of shards, reconstruct the key in RAM, build and
+sign an EVM transaction, wipe the key, and output the signed transaction.
 
 ```bash
-horcrux sign
+horcrux sign \
+    --shard ./usb/shard-1.hx --password guardian-1 \
+    --shard ./usb/shard-2.hx --password guardian-2 \
+    --to 0xRecipientAddress \
+    --value 0.001 \
+    --nonce 0 \
+    --gas 21000 \
+    --max-fee-per-gas 20 \
+    --max-priority-fee-per-gas 1
 ```
 
-Required
+EIP-1559 fees are the default. Legacy transactions use `--gas-price` instead
+(conflicts with the EIP-1559 flags):
 
-- threshold number of USB drives
+```bash
+horcrux sign \
+    --shard ./usb/shard-1.hx --password guardian-1 \
+    --shard ./usb/shard-2.hx --password guardian-2 \
+    --to 0xRecipientAddress --value 0.001 \
+    --nonce 0 --gas 21000 --gas-price 5
+```
 
-- guardian passwords
+- Required: `--to`, `--value`, `--nonce`, `--gas`, and one fee model.
+- Optional: `--calldata` (hex), `--chain-id` (default Sepolia `11155111`),
+  `--from` (skips nonce check), and `--broadcast`.
+
+Broadcast to an EVM RPC (Sepolia by default), fetching any missing fields and
+waiting for the receipt:
+
+```bash
+HORCRUX_RPC_URL=https://rpc.sepolia.org \
+horcrux sign \
+    --shard ./usb/shard-1.hx --password guardian-1 \
+    --shard ./usb/shard-2.hx --password guardian-2 \
+    --to 0xRecipientAddress --value 0.001 \
+    --broadcast
+```
 
 Output
 
@@ -728,7 +758,7 @@ Raw Hex
 
 ↓
 
-Broadcast
+Broadcast (opt-in)
 ```
 
 ---

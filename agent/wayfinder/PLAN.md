@@ -79,7 +79,7 @@ feed a wrong password and watch decryption fail cleanly (AES-GCM auth tag reject
 
 ---
 
-## Phase 2 — Mode A Signing + Broadcast (Week 2)
+## Phase 2 — Mode A Signing + Broadcast (Week 2) [Done]
 
 **Build:** `horcrux sign` — take t shard paths + passwords, decrypt, reconstruct key in
 memory, build and sign a standard EVM transaction with `k256`/`alloy`, immediately
@@ -92,6 +92,14 @@ agent can draft, but you should personally verify the memory-wipe timing.
 passwords → reconstructed key in RAM → signed tx → broadcast → transaction visible and
 confirmed on Sepolia Etherscan. **At this point you have a complete, defensible project**
 even if nothing below gets built.
+
+> **Status — closed** with the commits from `2fc4ac6` through the Phase 2 docs commit.
+> See [`agent/discussions/PHASE_2.md`](agent/discussions/PHASE_2.md) for the report.
+> Signing happens entirely offline (EIP-1559 by default, legacy via `--gas-price`);
+> broadcast is opt-in via `--broadcast` using `$HORCRUX_RPC_URL` (default Sepolia).
+> The `k256` zeroize caveat noted at the end of Phase 1 was resolved: `SecretKey` and
+> `ecdsa::SigningKey` zeroize the scalar on drop unconditionally, and the alloy signer
+> wrapper is compiled with its `zeroize` feature.
 
 ---
 
