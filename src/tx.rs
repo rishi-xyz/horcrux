@@ -1,303 +1,222 @@
-//! Offline EVM transaction building and signing (Mode A).
+//! Offline Solana transaction building and signing (Mode A).
 //!
-//! This module builds and signs a standard EVM transaction entirely in memory:
+//! This module builds and signs a Solana transaction entirely in memory:
 //! no RPC access and no network I/O. The caller supplies a fully-specified
-//! [`TxParams`]; [`sign_transaction`] derives the sender address from the key,
-//! hashes and signs the transaction, and returns a [`TxEnvelope`] ready to be
-//! RLP-encoded for broadcast.
+//! [`TxParams`]; [`sign_transaction`] derives the Ed25519/Solana address from
+//! the seed, signs the message, and returns a [`SignedTx`] ready to broadcast.
 //!
-//! The private key is moved into the signer and never cloned: the scalar is
-//! zeroized on drop by `k256` (and, with the `zeroize` feature enabled, by the
-//! alloy signer wrapper as well).
+//! The signing key is an Ed25519 [`SigningKey`](ed25519_dalek::SigningKey)
+//! built from the seed; with the crate's `zeroize` feature it wipes its scalar
+//! on drop, and the caller's seed buffer is zeroized before returning.
+//!
+//! # Why we sign `message.serialize()` and not `message.hash()`
+//!
+//! The bytes Ed25519 signs are the bincode serialization of the legacy
+//! [`Message`] (`message.serialize()`). This matches the wire encoding that
+//! `solana-rpc-client` hands to the cluster for `sendTransaction`, so a
+//! signature produced here verifies exactly what the node will see.
 
 use crate::error::Error;
-use alloy::consensus::transaction::SignerRecoverable;
-use alloy::consensus::{SignableTransaction, TxEnvelope, TxType};
-use alloy::eips::eip2718::Encodable2718;
-use alloy::network::{NetworkTransactionBuilder, TransactionBuilder};
-use alloy::primitives::{Address, B256, Bytes, ChainId, Signature, U256};
-use alloy::rpc::types::TransactionRequest;
-use k256::SecretKey;
-use k256::ecdsa::SigningKey;
-use k256::ecdsa::signature::hazmat::PrehashSigner;
+use ed25519_dalek::Signer as _;
+use solana_hash::Hash;
+use solana_message::Message;
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
+use solana_transaction::Transaction;
+use zeroize::Zeroize;
 
-/// Default chain id used when none is supplied (Sepolia).
-pub const DEFAULT_CHAIN_ID: ChainId = 11155111;
-
-/// Fee model for a transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fee {
-    /// Legacy EIP-155 transaction priced by a single `gas_price`.
-    Legacy { gas_price: u128 },
-    /// EIP-1559 fee-market transaction.
-    Eip1559 {
-        max_fee_per_gas: u128,
-        max_priority_fee_per_gas: u128,
-    },
-}
-
-/// A fully-specified EVM transaction, ready to sign.
+/// A fully-specified Solana transaction, ready to sign.
 #[derive(Debug, Clone)]
 pub struct TxParams {
+    /// Sender address (fee payer). Must match the address derived from the key.
+    pub from: Pubkey,
     /// Recipient address.
-    pub to: Address,
-    /// Value in wei.
-    pub value: U256,
-    /// Calldata (empty for a plain transfer).
-    pub data: Bytes,
-    /// Chain id, used for EIP-155 replay protection.
-    pub chain_id: ChainId,
-    /// Account nonce.
-    pub nonce: u64,
-    /// Gas limit.
-    pub gas_limit: u64,
-    /// Fee model.
-    pub fee: Fee,
-}
-
-impl TxParams {
-    /// Build a plain-value-transfer parameter set with an EIP-1559 fee model.
-    pub fn eip1559_transfer(
-        to: Address,
-        value: U256,
-        chain_id: ChainId,
-        nonce: u64,
-        gas_limit: u64,
-        max_fee_per_gas: u128,
-        max_priority_fee_per_gas: u128,
-    ) -> Self {
-        Self {
-            to,
-            value,
-            data: Bytes::new(),
-            chain_id,
-            nonce,
-            gas_limit,
-            fee: Fee::Eip1559 {
-                max_fee_per_gas,
-                max_priority_fee_per_gas,
-            },
-        }
-    }
+    pub to: Pubkey,
+    /// Amount to transfer, in lamports (1 SOL = 1_000_000_000 lamports).
+    pub lamports: u64,
+    /// Recent blockhash (fetched live, or supplied offline via `--blockhash`).
+    pub blockhash: Hash,
 }
 
 /// A signed, ready-to-broadcast transaction.
 #[derive(Debug, Clone)]
 pub struct SignedTx {
-    from: Address,
-    envelope: TxEnvelope,
+    from: Pubkey,
+    tx: Transaction,
+    signature: Signature,
 }
 
 impl SignedTx {
     /// The sender address (derived from the signing key).
-    pub fn from(&self) -> Address {
+    pub fn from(&self) -> Pubkey {
         self.from
     }
 
-    /// The signed transaction envelope.
-    pub fn envelope(&self) -> &TxEnvelope {
-        &self.envelope
+    /// The signed transaction.
+    pub fn tx(&self) -> &Transaction {
+        &self.tx
     }
 
-    /// The transaction hash (keccak of the EIP-2718 encoding).
-    pub fn tx_hash(&self) -> B256 {
-        *self.envelope.tx_hash()
+    /// The Ed25519 signature (also serves as the Solana transaction id).
+    pub fn signature(&self) -> Signature {
+        self.signature
     }
 
-    /// The raw EIP-2718 encoding, ready to hand to `eth_sendRawTransaction`.
-    pub fn encoded(&self) -> Vec<u8> {
-        self.envelope.encoded_2718()
+    /// The raw bincode serialization of the transaction, ready for
+    /// `sendTransaction`.
+    pub fn raw(&self) -> Vec<u8> {
+        bincode::serialize(&self.tx).expect("transaction is serializable")
     }
 
-    /// The raw EIP-2718 encoding as a `0x`-prefixed lowercase hex string.
-    pub fn raw_hex(&self) -> String {
-        alloy::primitives::hex::encode_prefixed(self.encoded())
+    /// The raw transaction as a base58 string (what `solana rpc sendTransaction`
+    /// expects).
+    pub fn raw_base58(&self) -> String {
+        bs58::encode(self.raw()).into_string()
     }
 
-    /// Recover the signer address from the signature, cross-checking `from`.
-    pub fn recover_signer(&self) -> Option<Address> {
-        self.envelope.recover_signer().ok()
+    /// Verify the Ed25519 signature against the serialized message offline.
+    pub fn verify(&self) -> bool {
+        self.signature
+            .verify(&self.from.to_bytes(), &self.tx.message.serialize())
     }
 }
 
-/// Derive the Ethereum address (EIP-55 checksummed) for a private key.
-pub fn derive_address(key: &SecretKey) -> Address {
-    alloy::signers::utils::secret_key_to_address(&SigningKey::from(key))
+/// Derive the Solana address (base58 pubkey) for an Ed25519 seed.
+pub fn derive_address(seed: &[u8; 32]) -> Pubkey {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(seed);
+    Pubkey::from(signing_key.verifying_key().to_bytes())
 }
 
-/// Build the transaction request for the given sender and parameters.
-fn build_request(from: Address, params: &TxParams) -> TransactionRequest {
-    let mut request = TransactionRequest::default()
-        .from(from)
-        .to(params.to)
-        .value(params.value)
-        .with_input(params.data.clone())
-        .nonce(params.nonce)
-        .gas_limit(params.gas_limit)
-        .with_chain_id(params.chain_id);
-    match params.fee {
-        Fee::Legacy { gas_price } => {
-            request = request
-                .transaction_type(TxType::Legacy as u8)
-                .gas_price(gas_price);
-        }
-        Fee::Eip1559 {
-            max_fee_per_gas,
-            max_priority_fee_per_gas,
-        } => {
-            request = request
-                .transaction_type(TxType::Eip1559 as u8)
-                .max_fee_per_gas(max_fee_per_gas)
-                .max_priority_fee_per_gas(max_priority_fee_per_gas);
-        }
-    }
-    request
-}
-
-/// Sign a transaction for `key` entirely offline.
+/// Sign a Solana transfer for `seed` entirely offline.
 ///
-/// The key is consumed and the only copy of the scalar lives inside the
-/// [`SigningKey`], which zeroizes it on drop.
-pub fn sign_transaction(key: SecretKey, params: TxParams) -> Result<SignedTx, Error> {
-    let from = derive_address(&key);
-    let request = build_request(from, &params);
-    let unsigned = request
-        .build_unsigned()
-        .map_err(|e| Error::Tx(format!("could not build transaction: {e}")))?;
+/// The seed is consumed; the only in-memory copy of the key lives inside the
+/// [`SigningKey`](ed25519_dalek::SigningKey), which zeroizes it on drop, and
+/// the caller's buffer is zeroized before returning.
+pub fn sign_transaction(mut seed: [u8; 32], params: TxParams) -> Result<SignedTx, Error> {
+    let from = derive_address(&seed);
+    if params.from != from {
+        seed.zeroize();
+        return Err(Error::Tx(format!(
+            "derived address {from} does not match --from {}",
+            params.from
+        )));
+    }
 
-    let hash = unsigned.signature_hash();
-    let signing_key = SigningKey::from(key);
-    let (signature, recovery_id) = signing_key
-        .sign_prehash(hash.as_ref())
-        .map_err(|e| Error::Tx(format!("could not sign transaction: {e}")))?;
-    let signature: Signature = (signature, recovery_id).into();
+    let instruction = solana_system_interface::instruction::transfer(
+        &params.from,
+        &params.to,
+        params.lamports,
+    );
+    let message = Message::new_with_blockhash(&[instruction], Some(&params.from), &params.blockhash);
+    let sign_bytes = message.serialize();
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let dalek_sig = signing_key.sign(&sign_bytes);
+    let signature = Signature::from(dalek_sig.to_bytes());
+
+    if !signature.verify(&params.from.to_bytes(), &sign_bytes) {
+        seed.zeroize();
+        return Err(Error::Tx("signature failed local verification".into()));
+    }
+
+    seed.zeroize();
 
     Ok(SignedTx {
         from,
-        envelope: unsigned.into_signed(signature).into(),
+        tx: Transaction {
+            signatures: vec![signature],
+            message,
+        },
+        signature,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::consensus::Transaction;
-    use alloy::eips::eip2718::Decodable2718;
-    use alloy::primitives::address;
-    use rand::rngs::OsRng;
+    use std::str::FromStr as _;
 
-    /// Foundry's well-known test private key. Never use outside tests.
-    const TEST_KEY_HEX: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-    const TEST_KEY_ADDRESS: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
-
-    fn test_key() -> SecretKey {
-        SecretKey::from_slice(&hex::decode(&TEST_KEY_HEX[2..]).expect("valid test key hex"))
-            .expect("valid test key")
-    }
+    /// Foundry's well-known test private key, reused as a fixed Ed25519 seed.
+    /// Never use outside tests.
+    const TEST_SEED: [u8; 32] = [
+        0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2, 0x38, 0xff,
+        0x94, 0x4b, 0xac, 0xb4, 0x78, 0xcb, 0xed, 0x5e, 0xfc, 0xae, 0x78, 0x4d, 0x7b, 0xf4, 0xf2,
+        0xff, 0x80,
+    ];
 
     fn params() -> TxParams {
         TxParams {
-            to: address!("d8dA6BF26964aF9D7eEd9e03E53415D37aA96045"),
-            value: U256::from(1_000_000u64),
-            data: Bytes::new(),
-            chain_id: DEFAULT_CHAIN_ID,
-            nonce: 7,
-            gas_limit: 21_000,
-            fee: Fee::Eip1559 {
-                max_fee_per_gas: 20_000_000_000,
-                max_priority_fee_per_gas: 1_000_000_000,
-            },
+            from: derive_address(&TEST_SEED),
+            to: derive_address(&[0x1b; 32]),
+            lamports: 1_000_000,
+            blockhash: Hash::new_from_array([0x5a; 32]),
         }
     }
 
     #[test]
-    fn derives_expected_address() {
-        let key = test_key();
-        assert_eq!(derive_address(&key).to_checksum(None), TEST_KEY_ADDRESS);
+    fn derives_address_from_verifying_key() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&TEST_SEED);
+        let expected = Pubkey::from(signing_key.verifying_key().to_bytes());
+        assert_eq!(derive_address(&TEST_SEED), expected);
     }
 
     #[test]
-    fn derived_address_matches_verifying_key() {
-        let key = SecretKey::random(&mut OsRng);
-        let expected: Address =
-            alloy::signers::utils::secret_key_to_address(&SigningKey::from(&key));
-        assert_eq!(derive_address(&key), expected);
+    fn sign_transaction_verifies_and_records_sender() {
+        let signed = sign_transaction(TEST_SEED, params()).expect("sign");
+        assert_eq!(signed.from(), derive_address(&TEST_SEED));
+        assert!(signed.verify());
+        assert_eq!(signed.tx().signatures.len(), 1);
+        assert_eq!(signed.tx().signatures[0], signed.signature());
     }
 
     #[test]
-    fn eip1559_signing_recovers_sender() {
-        let key = test_key();
-        let signed = sign_transaction(key, params()).expect("sign");
-        assert_eq!(signed.from().to_checksum(None), TEST_KEY_ADDRESS);
-        assert_eq!(signed.recover_signer(), Some(signed.from()));
-        assert!(signed.envelope().as_eip1559().is_some());
+    fn rejects_from_mismatch() {
+        let mut p = params();
+        p.from = derive_address(&[7u8; 32]);
+        let err = sign_transaction(TEST_SEED, p).expect_err("from mismatch must error");
+        assert!(err.to_string().contains("does not match"));
     }
 
     #[test]
-    fn legacy_signing_recovers_sender_and_applies_eip155() {
-        let key = test_key();
-        let mut params = params();
-        params.fee = Fee::Legacy {
-            gas_price: 15_000_000_000,
-        };
-        let signed = sign_transaction(key, params).expect("sign");
-        assert_eq!(signed.recover_signer(), Some(signed.from()));
-
-        let legacy = signed.envelope().as_legacy().expect("legacy envelope");
-        assert_eq!(legacy.tx().chain_id(), Some(DEFAULT_CHAIN_ID));
-        assert_eq!(legacy.tx().gas_price(), Some(15_000_000_000));
+    fn signature_is_over_serialized_message() {
+        let signed = sign_transaction(TEST_SEED, params()).expect("sign");
+        let sign_bytes = signed.tx().message.serialize();
+        assert!(signed.signature().verify(&signed.from().to_bytes(), &sign_bytes));
     }
 
     #[test]
-    fn raw_hex_round_trips_through_decode_2718() {
-        let key = test_key();
-        let signed = sign_transaction(key, params()).expect("sign");
-        let raw = signed.encoded();
-        let mut slice = raw.as_slice();
+    fn raw_base58_round_trips_through_bincode() {
+        let signed = sign_transaction(TEST_SEED, params()).expect("sign");
+        let raw = signed.raw();
+        let decoded: Transaction = bincode::deserialize(&raw).expect("deserializes");
+        assert_eq!(bincode::serialize(&decoded).expect("reserializes"), raw);
+        assert_eq!(decoded.signatures, signed.tx().signatures);
+        assert_eq!(
+            decoded.message.serialize(),
+            signed.tx().message.serialize()
+        );
 
-        let decoded = TxEnvelope::decode_2718(&mut slice).expect("decodes");
-        assert_eq!(decoded.tx_hash(), &signed.tx_hash());
-        assert_eq!(decoded.recover_signer().expect("recovers"), signed.from());
+        let from_b58: Pubkey =
+            Pubkey::from_str(&bs58::decode(signed.raw_base58()).into_vec().expect("valid base58"))
+                .expect("decodes to pubkey");
+        assert_eq!(from_b58, signed.from());
     }
 
     #[test]
-    fn same_params_produce_same_transaction() {
-        let a = sign_transaction(test_key(), params()).expect("sign a");
-        let b = sign_transaction(test_key(), params()).expect("sign b");
-        assert_eq!(a.tx_hash(), b.tx_hash());
-        assert_eq!(a.raw_hex(), b.raw_hex());
-    }
-
-    #[test]
-    fn different_nonce_produces_different_transaction() {
+    fn different_blockhash_produces_different_signature() {
         let mut p2 = params();
-        p2.nonce += 1;
-        let a = sign_transaction(test_key(), params()).expect("sign a");
-        let b = sign_transaction(test_key(), p2).expect("sign b");
-        assert_ne!(a.tx_hash(), b.tx_hash());
+        p2.blockhash = Hash::new_from_array([0x6b; 32]);
+        let a = sign_transaction(TEST_SEED, params()).expect("sign a");
+        let b = sign_transaction(TEST_SEED, p2).expect("sign b");
+        assert_ne!(a.signature(), b.signature());
     }
 
     #[test]
-    fn data_payload_round_trips() {
-        let key = test_key();
-        let mut params = params();
-        let payload = Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]);
-        params.data = payload.clone();
-        let signed = sign_transaction(key, params).expect("sign");
-        let raw = signed.encoded();
-        let mut slice = raw.as_slice();
-
-        let decoded = TxEnvelope::decode_2718(&mut slice).expect("decodes");
-        let eip1559 = decoded.as_eip1559().expect("eip1559");
-        assert_eq!(eip1559.tx().input(), &payload);
-        assert_eq!(decoded.recover_signer().expect("recovers"), signed.from());
-    }
-
-    #[test]
-    fn tx_hash_matches_rlp_digest() {
-        let key = test_key();
-        let signed = sign_transaction(key, params()).expect("sign");
-        let digest = alloy::primitives::keccak256(signed.encoded());
-        assert_eq!(digest, signed.tx_hash());
+    fn different_lamports_produce_different_signature() {
+        let mut p2 = params();
+        p2.lamports += 1;
+        let a = sign_transaction(TEST_SEED, params()).expect("sign a");
+        let b = sign_transaction(TEST_SEED, p2).expect("sign b");
+        assert_ne!(a.signature(), b.signature());
     }
 }
