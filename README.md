@@ -651,11 +651,9 @@ HORCRUX exposes a simple command-line interface.
 ```
 horcrux
 ├── init
+├── reconstruct
 ├── sign
-├── mpc-sign
-├── verify
-├── inspect
-├── logs
+├── log
 └── help
 ```
 
@@ -724,6 +722,8 @@ horcrux sign \
   (e.g. `solana blockhash`).
 - Optional: `--rpc-url` (overrides `$HORCRUX_RPC_URL`, default
   `http://127.0.0.1:8899`) and `--broadcast`.
+- Audit: `--log-file` (default `./horcrux-access.log` or `$HORCRUX_ACCESS_LOG`)
+  records every shard decryption, and `--force` bypasses an audit block.
 
 Broadcast to the cluster (local validator by default), fetching the latest
 blockhash and waiting for confirmation:
@@ -815,25 +815,63 @@ Checks
 
 ---
 
-## Logs
+## Log
 
-View access logs.
+View the access log (JSON-lines, append-only).
 
 ```bash
-horcrux logs
+horcrux log
+horcrux log --tail 10
+horcrux log --json
 ```
 
-Displays
+Shows
 
-- timestamp
+- timestamp (UTC)
 
-- guardian
+- shard id
 
-- success
+- outcome: `ok` / `fail` / `blocked`
 
-- failure
+---
 
-- anomaly score
+## Access Logging & Anomaly Detection
+
+Every shard decryption attempt is recorded to an **append-only** access log as a
+JSON-lines entry:
+
+```json
+{"ts":1767225600000,"attempt":12345,"shard_id":1,"kind":"decrypt_ok"}
+```
+
+No passwords or key material are ever logged. Before signing (or
+reconstructing), the audit layer (src/audit.rs) scores the attempt against the
+log and returns a verdict:
+
+| Signal | Effect |
+|--------|--------|
+| 3+ trailing decrypt failures within the last hour | **Block** |
+| Attempt during unusual hours (UTC 00:00–06:00) | Warn |
+| Shard combination never used before | Warn |
+| Gap since last access has z-score > 3 | Warn |
+
+A **Block** refuses the operation before any key material is handled; the
+refused attempt is itself logged. `--force` overrides a block (still logged).
+
+```bash
+# normal history -> signing proceeds and is logged
+horcrux sign shard-1.hx shard-2.hx --password guardian \
+    --to RecipientAddressBase58 --lamports 1000 --blockhash <base58>
+
+# three wrong-password attempts...
+horcrux sign shard-1.hx shard-2.hx --password wrong ...
+horcrux sign shard-1.hx shard-2.hx --password wrong ...
+horcrux sign shard-1.hx shard-2.hx --password wrong ...
+
+# ...then a legitimate attempt is refused before signing
+horcrux sign shard-1.hx shard-2.hx --password guardian ...
+# access audit blocked the attempt: 3 failed decrypt attempts within the last 3600s
+```
 
 ---
 

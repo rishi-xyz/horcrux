@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# horcrux — interactive Phase 1 demo
+# horcrux — interactive demo (Phase 1 + a Phase 3 audit teaser)
 #
-# Walks through everything built in Phase 1: split + per-shard encryption
+# Walks through everything built so far: split + per-shard encryption
 # (SSS via vsss-rs, Argon2id, AES-256-GCM), the 83-byte shard file format,
-# reconstruction from any threshold subset, and the failure modes
-# (wrong password / too few shards / mixed splits).
+# reconstruction from any threshold subset, the failure modes
+# (wrong password / too few shards / mixed splits), and the access-log /
+# anomaly-detection layer that blocks repeated failed attempts.
 #
 #   ./demo.sh          interactive step-through
 #   ./demo.sh --auto   run all steps without pausing
@@ -93,11 +94,12 @@ trap cleanup EXIT
 # =====================================================================
 # DEMO
 # =====================================================================
-printf '%s\n' "horcrux -- Phase 1 interactive demo"
+printf '%s\n' "horcrux -- interactive demo"
 printf '%s\n' "==================================="
-info "This walks through everything built so far: split + per-shard encryption"
+info "Walks through everything built so far: split + per-shard encryption"
 info "(vsss-rs Shamir, Argon2id, AES-256-GCM), the 83-byte shard format,"
-info "reconstruction from any 2 of 3 shards, and the failure modes."
+info "reconstruction from any 2 of 3 shards, the failure modes, and the"
+info "access-log / anomaly-detection layer (Phase 3)."
 info "Each step runs the real CLI. Press Enter to advance."
 pause
 
@@ -245,10 +247,46 @@ else
 fi
 pause
 
-# --- 11. optional test suite ------------------------------------------
-step 11 "full test suite (optional)"
-info "cargo test runs 23 unit tests (sss, crypto, shard, lib) plus 8 integration"
-info "tests in tests/roundtrip.rs."
+# --- 11. access log + anomaly detection --------------------------------
+step 11 "access log -- normal attempt, then 3 failures -> blocked"
+info "Every shard decryption is appended to the access log (src/audit.rs,"
+info "JSON-lines, append-only). Before signing, a rule-based scorer reads the"
+info "history: 3 recent failed decrypts block the next attempt entirely."
+BH="5uB24TAxhvkdErSJUJMaPX2DgZtDzR2EjSjYTMrY56zs"
+TO="dQT7Vmpq2WFzWsi8SuYCqw2JoQkfpadyHSsQiLEMJDJ"
+LOG_FLAG=(--log-file "$OUT/access.log")
+show "$BIN" sign "$OUT/shard-1.hx" "$OUT/shard-2.hx" --password "$PW" "${LOG_FLAG[@]}" \
+    --to "$TO" --lamports 1 --blockhash "$BH"
+"$BIN" sign "$OUT/shard-1.hx" "$OUT/shard-2.hx" --password "$PW" "${LOG_FLAG[@]}" \
+    --to "$TO" --lamports 1 --blockhash "$BH" >/dev/null
+ok "first-time attempt allowed; both shard decrypts logged"
+show "$BIN" log "${LOG_FLAG[@]}" --tail 3
+"$BIN" log "${LOG_FLAG[@]}" --tail 3
+info "Now three wrong-password attempts (each logged as a failure)..."
+for i in 1 2 3; do
+    "$BIN" sign "$OUT/shard-1.hx" "$OUT/shard-2.hx" --password "wrong-$i" "${LOG_FLAG[@]}" \
+        --to "$TO" --lamports 1 --blockhash "$BH" 2>/dev/null || true
+done
+show "$BIN" sign "$OUT/shard-1.hx" "$OUT/shard-2.hx" --password "$PW" "${LOG_FLAG[@]}" \
+    --to "$TO" --lamports 1 --blockhash "$BH"
+if "$BIN" sign "$OUT/shard-1.hx" "$OUT/shard-2.hx" --password "$PW" "${LOG_FLAG[@]}" \
+    --to "$TO" --lamports 1 --blockhash "$BH" 2>"$OUT/err-blocked.txt"; then
+    fail "signing should have been blocked after 3 failures"
+    exit 1
+fi
+printf '%s%s%s\n' "$RED" "$(cat "$OUT/err-blocked.txt")" "$RESET"
+if grep -q "access audit blocked the attempt" "$OUT/err-blocked.txt"; then
+    ok "blocked before signing -- key material never handled"
+else
+    fail "unexpected error output"
+    exit 1
+fi
+pause
+
+# --- 12. optional test suite ------------------------------------------
+step 12 "full test suite (optional)"
+info "cargo test runs 48 unit tests (sss, crypto, shard, chain, audit, lib) plus"
+info "integration suites: tests/roundtrip.rs, tests/sign.rs, tests/audit.rs."
 run_tests=0
 if [[ "$AUTO" == 1 ]]; then
     run_tests=1
@@ -280,9 +318,11 @@ ok "reconstruct:all 3 shards also recover the key"
 ok "rejected:   wrong password (AES-GCM auth-tag failure)"
 ok "rejected:   too few shards (NotEnoughShares)"
 ok "rejected:   mixed splits (SplitMismatch)"
+ok "audit:       every shard decrypt logged; 3 failures block signing"
 if [[ "$run_tests" == 1 ]]; then
-    ok "tests:      23 unit + 8 integration tests green"
+    ok "tests:      48 unit + 8 roundtrip + 3 sign + 4 audit tests green"
 fi
 printf '%s\n' "---"
-info "That is Phase 1 end to end. Next up: Phase 2 -- 'sign' (reconstruct in RAM,"
-info "build a Solana transaction offline and optionally broadcast it)."
+info "Phases 1-2 are done end to end (init, reconstruct, offline sign +"
+info "broadcast to the local validator). Next up: Phase 4 -- Mode B FROST,"
+info "where the key never exists on any machine."

@@ -88,7 +88,7 @@ feed a wrong password and watch decryption fail cleanly (AES-GCM auth tag reject
 
 ---
 
-## Phase 2 — Mode A Signing + Broadcast (Week 2) [In progress]
+## Phase 2 — Mode A Signing + Broadcast (Week 2) [Done]
 
 **Build:** `horcrux sign` — take t shard paths + passwords, decrypt, reconstruct key in
 memory, derive the Ed25519/Solana address, build an unsigned Solana `Message`
@@ -105,8 +105,9 @@ passwords → reconstructed key in RAM → signed tx → broadcast → tx confir
 `solana-test-validator` log. **At this point you have a complete, defensible project**
 even if nothing below gets built.
 
-> **Status — re-planned (Solana switch).** Phase 2 was originally built against EVM/`alloy`
-> (commits `2fc4ac6` → `de6de26`) and is being rewritten for Solana localnet. Key deltas:
+> **Status — done.** Phase 2 is fully implemented and verified against a live local
+> validator (commits `7382351`, `d826bec`): offline sign + broadcast, fee-aware errors,
+> and a confirmed on-chain transfer. Key deltas from the original EVM plan:
 > no gas/nonce/chain-id — the only network input is a recent blockhash
 > (`get_latest_blockhash()`), fetched live or supplied offline via `--blockhash`. Address
 > space: seed bytes (0..32) = signing key, (32..64) = derived pubkey, (64..) = system
@@ -116,31 +117,34 @@ even if nothing below gets built.
 
 ---
 
-## Phase 3 — Access Logging + Anomaly Detection (Week 3)
+## Phase 3 — Access Logging + Anomaly Detection (Week 3) [Done]
 
 **Build:** log every decryption attempt (timestamp, shard id, success/failure) to a local
 append-only log. Score each new signing attempt against historical pattern; flag/block
 before signing if anomalous (e.g., odd hour, repeated failures, unfamiliar shard
 combination).
 
-**Open decision (pick one before you start):**
-- **Python bridge:** a small `scikit-learn` `IsolationForest` script the Rust CLI shells
-  out to over stdin/stdout JSON. Matches your report's stated algorithm exactly, lowest
-  implementation risk, easy to defend in viva ("we integrated a standard, well-validated
-  anomaly model").
-- **Rust-native:** a simple statistical/rule-based scorer (z-score on access timing +
-  hard rule on failed-attempt count) written directly in Rust. No FFI/subprocess
-  complexity, but less literally "Isolation Forest" if you want to keep that exact claim
-  in your report.
+**Decision made: Rust-native scorer** (no Python/IsolationForest bridge). Rationale: one
+binary, no FFI/subprocess, deterministic unit tests, and an easy viva story — a standard
+statistical/rule-based model (z-scores + hard rules) rather than a thin wrapper.
 
-Given your timeline, the Python-bridge route is the lower-risk default — flag if you'd
-rather go Rust-native and we'll scope that version instead.
-
-**AI agent fit:** high for the log plumbing; medium for the scoring logic.
+**What shipped (commits `820d762`):**
+- `src/audit.rs` — JSON-lines `AccessLog` (append-only, `./horcrux-access.log` default,
+  `--log-file`/`$HORCRUX_ACCESS_LOG` override) recording `decrypt_ok`/`decrypt_fail`/
+  `blocked` per shard; `Scorer` with `Verdict::{Allow,Warn,Block}`.
+- Rules: **Block** after 3 trailing decrypt failures within the last hour (success resets
+  the run); **Warn** on odd UTC hour (00:00–06:00, hand-rolled conversion — no `chrono`),
+  unfamiliar shard-id combination, and inter-attempt gap z-score > 3. Blocked attempts are
+  logged too, so a refused attempt cannot hide.
+- CLI: `sign`/`reconstruct` run a pre-flight check before any key material is handled;
+  `--force` overrides a block (still logged); `horcrux log [--tail N] [--json]` views the
+  log. `reconstruct_with_audit` records each shard decrypt outcome (best-effort logging).
+- Tests: 14 scorer/log unit tests + `tests/audit.rs` (block/allow/log integration).
+  `cargo test` = 48 unit + 8 roundtrip + 3 sign + 4 audit, all green.
 
 **Visible outcome:** two side-by-side demo runs — a normal access pattern gets approved,
 an injected anomalous pattern (e.g., 5 failed attempts, then a 3 AM signing attempt) gets
-flagged and blocked before signing proceeds.
+flagged and blocked before signing proceeds (see demo.sh step 11).
 
 ---
 
