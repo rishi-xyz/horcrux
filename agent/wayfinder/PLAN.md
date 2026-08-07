@@ -148,7 +148,7 @@ flagged and blocked before signing proceeds (see demo.sh step 11).
 
 ---
 
-## Phase 4 — Mode B: True Threshold MPC via FROST (Weeks 4–6)
+## Phase 4 — Mode B: True Threshold MPC via FROST (Weeks 4–6) [Done]
 
 **This is the highest-risk phase — budget 3 weeks, not 1.**
 
@@ -173,6 +173,22 @@ logic itself.
 **Visible outcome:** a 3-terminal demo — guardian 1, guardian 2, coordinator — producing
 a valid signature, plus a log/memory inspection showing the full private key never
 appears on any single process at any point.
+
+> **Status — done.** The **trusted-dealer fallback** was chosen (per the plan's own
+> contingency): `horcrux mpc-split` dealer-splits the Mode A seed with `frost-ed25519`
+> into t-of-n encrypted key shares (default 2-of-3, `mpc-{id}.hx` + non-secret
+> `group.pub`), and `horcrux mpc-sign` runs the two-round protocol with one in-process
+> participant per share file — the full key is never assembled on any machine. Because
+> the split derives the FROST group from the same 32-byte seed, the group address equals
+> the Mode A wallet address, and the aggregated signature is an ordinary RFC 8032 Ed25519
+> signature verifiable by any verifier (RFC 9591 compatibility), so it flows through the
+> Phase 2 Solana sign/broadcast path unchanged. Security properties verified by tests:
+> any threshold subset signs and verifies under plain Ed25519, one-share and
+> wrong-password attempts fail cleanly, shares from different groups are rejected, and
+> SSS shards cannot be misused as FROST shares (distinct `HX1`/`HX2` file magics). The
+> audit layer logs each participant decrypt and a final `signed` entry. Gates green:
+> `cargo fmt`, `cargo clippy --all-targets --offline -- -D warnings`, `cargo test`
+> (58 unit + 22 integration = 80 tests), and the full `./demo.sh --auto` run.
 
 ---
 

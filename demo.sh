@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# horcrux — interactive demo (Phase 1 + a Phase 3 audit teaser)
+# horcrux — interactive demo (Phases 1-4)
 #
 # Walks through everything built so far: split + per-shard encryption
 # (SSS via vsss-rs, Argon2id, AES-256-GCM), the 83-byte shard file format,
 # reconstruction from any threshold subset, the failure modes
-# (wrong password / too few shards / mixed splits), and the access-log /
-# anomaly-detection layer that blocks repeated failed attempts.
+# (wrong password / too few shards / mixed splits), the access-log /
+# anomaly-detection layer that blocks repeated failed attempts, and Mode B
+# FROST threshold signing where the key is never reconstructed on any machine.
 #
 #   ./demo.sh          interactive step-through
 #   ./demo.sh --auto   run all steps without pausing
@@ -98,8 +99,9 @@ printf '%s\n' "horcrux -- interactive demo"
 printf '%s\n' "==================================="
 info "Walks through everything built so far: split + per-shard encryption"
 info "(vsss-rs Shamir, Argon2id, AES-256-GCM), the 83-byte shard format,"
-info "reconstruction from any 2 of 3 shards, the failure modes, and the"
-info "access-log / anomaly-detection layer (Phase 3)."
+info "reconstruction from any 2 of 3 shards, the failure modes, the"
+info "access-log / anomaly-detection layer (Phase 3), and Mode B FROST"
+info "threshold signing where the key is never reconstructed (Phase 4)."
 info "Each step runs the real CLI. Press Enter to advance."
 pause
 
@@ -307,6 +309,94 @@ else
     warn "skipped (run 'cargo test' yourself to see the suite)"
 fi
 
+# --- 13. Mode B: FROST threshold signing --------------------------------
+step 13 "Mode B -- FROST threshold signing, key never reconstructed"
+info "mpc-split (src/mpc.rs) dealer-splits the SAME key into t-of-n key shares"
+info "via frost-ed25519 (RFC 9591). Each share file is an independent participant;"
+info "the full key never exists on any machine."
+show "$BIN" mpc-split --key-hex "0x$KEY" --threshold "$T" --shares "$N" \
+    --out-dir "$OUT/mpc" --password "$PW"
+MPC_OUT="$("$BIN" mpc-split --key-hex "0x$KEY" --threshold "$T" --shares "$N" \
+    --out-dir "$OUT/mpc" --password "$PW")"
+printf '%s\n' "$MPC_OUT"
+ok "split wrote 3 key shares plus the non-secret group public package"
+pause
+
+step 13b "Mode B -- sign with 2 of 3 shares (offline)"
+info "Each share contributes nonces (round 1) and a signature share (round 2);"
+info "the coordinator aggregates them into a single Ed25519 signature."
+show "$BIN" mpc-sign "$OUT/mpc/mpc-1.hx" "$OUT/mpc/mpc-2.hx" --group-dir "$OUT/mpc" \
+    --password "$PW" --to "$TO" --lamports 1 --blockhash "$BH"
+MPC_SIGN="$("$BIN" mpc-sign "$OUT/mpc/mpc-1.hx" "$OUT/mpc/mpc-2.hx" --group-dir "$OUT/mpc" \
+    --password "$PW" --to "$TO" --lamports 1 --blockhash "$BH")"
+printf '%s\n' "$MPC_SIGN"
+MPC_FROM="$(printf '%s\n' "$MPC_SIGN" | sed -n 's/^From:      //p')"
+ok "produced a valid Ed25519 signature without ever reconstructing the key"
+pause
+
+step 13c "Mode B -- same wallet as Mode A, non-deterministic"
+info "The group address equals the Mode A address of the same key, so a FROST"
+info "signature is indistinguishable from one signed by the full key."
+show "$BIN" sign "$OUT/shard-1.hx" "$OUT/shard-2.hx" --password "$PW" \
+    --to "$TO" --lamports 1 --blockhash "$BH"
+A_SIGN="$("$BIN" sign "$OUT/shard-1.hx" "$OUT/shard-2.hx" --password "$PW" \
+    --to "$TO" --lamports 1 --blockhash "$BH")"
+printf '%s\n' "$A_SIGN" >/dev/null
+A_FROM="$(printf '%s\n' "$A_SIGN" | sed -n 's/^From:      //p')"
+if [[ -n "$MPC_FROM" && "$MPC_FROM" == "$A_FROM" ]]; then
+    ok "Mode A and Mode B derive the same sender address: $A_FROM"
+else
+    fail "Mode A and Mode B sender addresses differ -- FROST group key mismatch"
+    exit 1
+fi
+show "$BIN" mpc-sign "$OUT/mpc/mpc-1.hx" "$OUT/mpc/mpc-2.hx" --group-dir "$OUT/mpc" \
+    --password "$PW" --to "$TO" --lamports 1 --blockhash "$BH"
+MPC_AGAIN="$("$BIN" mpc-sign "$OUT/mpc/mpc-1.hx" "$OUT/mpc/mpc-2.hx" --group-dir "$OUT/mpc" \
+    --password "$PW" --to "$TO" --lamports 1 --blockhash "$BH")"
+printf '%s\n' "$MPC_AGAIN" >/dev/null
+MPC_SIG1="$(printf '%s\n' "$MPC_SIGN" | sed -n 's/^Signature: //p')"
+MPC_SIG2="$(printf '%s\n' "$MPC_AGAIN" | sed -n 's/^Signature: //p')"
+if [[ "$MPC_SIG1" != "$MPC_SIG2" ]]; then
+    ok "each signing operation uses fresh nonces (signatures differ across runs)"
+else
+    fail "FROST produced identical signatures -- nonce reuse"
+    exit 1
+fi
+pause
+
+step 13d "Mode B -- failure modes"
+info "One share is below the threshold (Error::NotEnoughShares), and a Mode A"
+info "shard file cannot be used as a FROST share (different file magic)."
+show "$BIN" mpc-sign "$OUT/mpc/mpc-1.hx" --group-dir "$OUT/mpc" \
+    --password "$PW" --to "$TO" --lamports 1 --blockhash "$BH"
+if "$BIN" mpc-sign "$OUT/mpc/mpc-1.hx" --group-dir "$OUT/mpc" \
+    --password "$PW" --to "$TO" --lamports 1 --blockhash "$BH" 2>"$OUT/err-mpc-few.txt"; then
+    fail "one share should never sign a 2-of-3 group"
+    exit 1
+fi
+printf '%s%s%s\n' "$RED" "$(cat "$OUT/err-mpc-few.txt")" "$RESET"
+if grep -q "need 2 shards but only 1 were provided" "$OUT/err-mpc-few.txt"; then
+    ok "rejected: not enough participants"
+else
+    fail "unexpected error output"
+    exit 1
+fi
+show "$BIN" mpc-sign "$OUT/shard-1.hx" "$OUT/shard-2.hx" --group-dir "$OUT/mpc" \
+    --password "$PW" --to "$TO" --lamports 1 --blockhash "$BH"
+if "$BIN" mpc-sign "$OUT/shard-1.hx" "$OUT/shard-2.hx" --group-dir "$OUT/mpc" \
+    --password "$PW" --to "$TO" --lamports 1 --blockhash "$BH" 2>"$OUT/err-mpc-mixed.txt"; then
+    fail "an SSS shard must not sign as a FROST share"
+    exit 1
+fi
+printf '%s%s%s\n' "$RED" "$(cat "$OUT/err-mpc-mixed.txt")" "$RESET"
+if grep -q "not a horcrux FROST share" "$OUT/err-mpc-mixed.txt"; then
+    ok "rejected: share type mismatch caught by file magic"
+else
+    fail "unexpected error output"
+    exit 1
+fi
+pause
+
 # --- wrap-up ------------------------------------------------------------
 printf '\n%s==============================================%s\n' "$BOLD" "$RESET"
 printf '%s  DEMO COMPLETE  --  everything verified %s\n' "$BOLD" "$RESET"
@@ -319,10 +409,13 @@ ok "rejected:   wrong password (AES-GCM auth-tag failure)"
 ok "rejected:   too few shards (NotEnoughShares)"
 ok "rejected:   mixed splits (SplitMismatch)"
 ok "audit:       every shard decrypt logged; 3 failures block signing"
+ok "mpc:         2-of-3 FROST key shares sign without reconstructing the key"
+ok "mpc:         same sender address as Mode A; signatures non-deterministic"
+ok "mpc:         rejected: too few participants / Mode A shard as FROST share"
 if [[ "$run_tests" == 1 ]]; then
-    ok "tests:      48 unit + 8 roundtrip + 3 sign + 4 audit tests green"
+    ok "tests:      58 unit + 8 roundtrip + 3 sign + 4 audit + 7 mpc tests green"
 fi
 printf '%s\n' "---"
-info "Phases 1-2 are done end to end (init, reconstruct, offline sign +"
-info "broadcast to the local validator). Next up: Phase 4 -- Mode B FROST,"
-info "where the key never exists on any machine."
+info "Phases 1-4 are done end to end: init, reconstruct, offline sign + broadcast"
+info "to the local validator, audit/anomaly detection, and Mode B FROST threshold"
+info "signing where the key never exists on any machine."

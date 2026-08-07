@@ -2,7 +2,7 @@
 
 > **Offline Threshold Key Management System for Blockchain Private Keys**
 
-HORCRUX is a Rust-based offline threshold key management system that eliminates the single point of failure associated with traditional cryptocurrency wallets. Instead of storing an entire private key on one device, HORCRUX distributes cryptographic control across multiple trusted guardians using **Shamir's Secret Sharing (SSS)** and supports **threshold ECDSA Multi-Party Computation (MPC)** for secure transaction signing.
+HORCRUX is a Rust-based offline threshold key management system that eliminates the single point of failure associated with traditional cryptocurrency wallets. Instead of storing an entire private key on one device, HORCRUX distributes cryptographic control across multiple trusted guardians using **Shamir's Secret Sharing (SSS)** and supports **FROST threshold Multi-Party Computation (MPC)** for secure transaction signing.
 
 Designed for self-custody, security-critical environments, and blockchain infrastructure, HORCRUX enables users to securely split, store, recover, and sign blockchain transactions without relying on cloud providers or centralized custody services.
 
@@ -118,11 +118,12 @@ Private key exists only inside locked RAM for a few milliseconds before being se
 
 ### Mode B
 
-True Threshold MPC.
+True Threshold MPC (FROST).
 
 The private key never exists on any machine.
 
-Guardians collaboratively generate a valid ECDSA signature.
+Guardians each hold one encrypted key share and collaboratively produce a
+valid Ed25519 signature without the key ever being reconstructed.
 
 ---
 
@@ -293,7 +294,7 @@ Suitable for:
 
 ## Threshold MPC
 
-Mode B uses threshold ECDSA.
+Mode B uses FROST threshold Ed25519 signing (RFC 9591).
 
 Instead of reconstructing the private key:
 
@@ -310,7 +311,7 @@ Guardian C
 
 ↓
 
-Partial Signatures
+Signature Shares
 
 ↓
 
@@ -318,7 +319,7 @@ Coordinator
 
 ↓
 
-Valid ECDSA Signature
+Valid Ed25519 Signature
 ```
 
 The private key never appears anywhere.
@@ -442,11 +443,11 @@ Guardian 3
 
 ↓
 
-Threshold Protocol
+FROST Threshold Protocol
 
 ↓
 
-ECDSA Signature
+Ed25519 Signature
 
 ↓
 
@@ -653,6 +654,8 @@ horcrux
 ├── init
 ├── reconstruct
 ├── sign
+├── mpc-split
+├── mpc-sign
 ├── log
 └── help
 ```
@@ -757,40 +760,59 @@ Broadcast (opt-in)
 
 ---
 
-## MPC Signing
+## MPC Signing (Mode B)
 
-Mode B
+FROST threshold signing: dealer-split a key into encrypted key shares, then
+sign with any threshold subset. The full signing key is never reconstructed on
+any machine.
+
+Split the key (writes `mpc-{id}.hx` share files plus a non-secret
+`group.pub`):
 
 ```bash
-horcrux mpc-sign
+horcrux mpc-split \
+    --threshold 2 \
+    --shares 3 \
+    --out-dir ./mpc
 ```
 
-Coordinator
+Sign with a threshold subset of share files:
 
-```
-Receive Partial Signatures
-
-↓
-
-Combine
-
-↓
-
-Generate Valid Signature
+```bash
+horcrux mpc-sign \
+    ./mpc/mpc-1.hx ./mpc/mpc-2.hx \
+    --group-dir ./mpc \
+    --password guardian \
+    --to RecipientAddressBase58 \
+    --lamports 1000000000 \
+    --blockhash <recent-base58-blockhash>
 ```
 
-Guardians
+Each share file is its own in-process participant in the two-round FROST
+protocol (round 1: nonce commitments, round 2: signature shares), which the
+coordinator aggregates into a single Ed25519 signature. Only nonces,
+commitments, and signature shares ever exist in memory.
+
+- Flags mirror `sign`: `--broadcast` (plus optional `--rpc-url`) fetches the
+  blockhash and broadcasts; `--log-file`/`$HORCRUX_ACCESS_LOG` records every
+  participant decrypt plus a final `signed` entry; `--force` overrides an audit
+  block.
+- The group address (the `From` line) equals the Mode A wallet address, so a
+  FROST-signed transaction is indistinguishable from one signed with the full
+  key — and can be broadcast to Solana unchanged.
+
+Mode B flow:
 
 ```
-Decrypt Local Share
-
+Decrypt Each Key Share
 ↓
-
-Participate In MPC
-
+Round 1: Nonce Commitments
 ↓
-
-Never Reveal Key
+Round 2: Signature Shares
+↓
+Aggregate
+↓
+Valid Ed25519 Signature
 ```
 
 ---
@@ -831,7 +853,7 @@ Shows
 
 - shard id
 
-- outcome: `ok` / `fail` / `blocked`
+- outcome: `ok` / `fail` / `blocked` / `signed`
 
 ---
 
@@ -1303,6 +1325,7 @@ Rust reduces classes of vulnerabilities common in systems programming.
 - AES Encryption
 - USB Storage
 - Mode A Signing
+- Mode B FROST Signing
 - Logging
 - AI Detection
 
