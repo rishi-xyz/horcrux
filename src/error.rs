@@ -47,4 +47,12 @@ pub enum Error {
     /// Failed to build, sign, or broadcast a Solana transaction.
     #[error("transaction error: {0}")]
     Tx(String),
+
+    /// The audit layer refused the attempt before any key material was used.
+    #[error("access audit blocked the attempt: {0}")]
+    Blocked(String),
+
+    /// The access log could not be read or written.
+    #[error("audit log error: {0}")]
+    Audit(String),
 }

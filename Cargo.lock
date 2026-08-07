@@ -1126,6 +1126,7 @@ dependencies = [
  "k256",
  "rand 0.8.7",
  "rpassword",
+ "serde",
  "serde_json",
  "solana-hash 3.0.0",
  "solana-message",

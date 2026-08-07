@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use horcrux::error::Error;
 use horcrux::tx::{TxParams, derive_address};
-use horcrux::{init_shards, reconstruct};
+use horcrux::{init_shards, reconstruct_with_audit};
 use k256::SecretKey;
 use rand::rngs::OsRng;
 use std::path::PathBuf;
@@ -49,6 +49,13 @@ enum Command {
         /// Use this password for every shard (else prompt per shard).
         #[arg(long)]
         password: Option<String>,
+        /// Access log file (default: ./horcrux-access.log or
+        /// $HORCRUX_ACCESS_LOG).
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+        /// Bypass audit blocking (blocked attempts are still logged).
+        #[arg(long)]
+        force: bool,
     },
     /// Sign a Solana transaction offline with a key reconstructed from shards,
     /// optionally broadcasting to a cluster.
@@ -75,6 +82,26 @@ enum Command {
         /// Broadcast the signed transaction and wait for confirmation.
         #[arg(long)]
         broadcast: bool,
+        /// Access log file (default: ./horcrux-access.log or
+        /// $HORCRUX_ACCESS_LOG).
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+        /// Bypass audit blocking (blocked attempts are still logged).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show the access log.
+    Log {
+        /// Access log file (default: ./horcrux-access.log or
+        /// $HORCRUX_ACCESS_LOG).
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+        /// Only print the last N entries.
+        #[arg(long)]
+        tail: Option<usize>,
+        /// Print raw JSON-lines instead of a human-readable table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -120,7 +147,12 @@ async fn main() -> anyhow::Result<()> {
                 println!("  {}", path.display());
             }
         }
-        Command::Reconstruct { shards, password } => {
+        Command::Reconstruct {
+            shards,
+            password,
+            log_file,
+            force,
+        } => {
             let passwords = collect_passwords(
                 shards.len(),
                 password,
@@ -134,7 +166,8 @@ async fn main() -> anyhow::Result<()> {
                 false,
             )?;
 
-            let key = reconstruct(&shards, &passwords)?;
+            let (access_log, attempt) = audit_preflight(&shards, log_file, force)?;
+            let key = reconstruct_with_audit(&shards, &passwords, &access_log, attempt)?;
             println!("Reconstructed key: 0x{}", hex::encode(key.to_bytes()));
         }
         Command::Sign {
@@ -145,6 +178,8 @@ async fn main() -> anyhow::Result<()> {
             blockhash,
             rpc_url,
             broadcast,
+            log_file,
+            force,
         } => {
             let passwords = collect_passwords(
                 shards.len(),
@@ -188,7 +223,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
-            let key = reconstruct(&shards, &passwords)?;
+            let (access_log, attempt) = audit_preflight(&shards, log_file, force)?;
+            let key = reconstruct_with_audit(&shards, &passwords, &access_log, attempt)?;
             let seed = horcrux::key_seed(&key);
             let from = derive_address(&seed);
 
@@ -226,8 +262,78 @@ async fn main() -> anyhow::Result<()> {
                 println!("Mined:     {signature} (confirmed)");
             }
         }
+        Command::Log {
+            log_file,
+            tail,
+            json,
+        } => {
+            let log = horcrux::audit::AccessLog::open(access_log_path(log_file));
+            let entries = match tail {
+                Some(n) => log.tail(n)?,
+                None => log.read_all()?,
+            };
+            if entries.is_empty() {
+                println!("No access log entries at {}", log.path().display());
+            }
+            for e in &entries {
+                if json {
+                    println!("{}", serde_json::to_string(e)?);
+                } else {
+                    let kind = match e.kind {
+                        horcrux::audit::EntryKind::DecryptOk => "ok",
+                        horcrux::audit::EntryKind::DecryptFail => "fail",
+                        horcrux::audit::EntryKind::Blocked => "blocked",
+                    };
+                    println!(
+                        "{}  {kind:<7}  shard {:>2}",
+                        horcrux::audit::format_utc(e.ts),
+                        e.shard_id
+                    );
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Run the audit pre-flight check: score the proposed attempt against the
+/// access log and either refuse (unless `--force`), warn, or allow it.
+///
+/// Returns the opened [`horcrux::audit::AccessLog`] and the attempt id shared
+/// by every entry logged for this invocation.
+fn audit_preflight(
+    shard_paths: &[PathBuf],
+    log_file: Option<PathBuf>,
+    force: bool,
+) -> anyhow::Result<(horcrux::audit::AccessLog, u64)> {
+    use horcrux::audit::{Entry, Scorer, Verdict};
+
+    let log = horcrux::audit::AccessLog::open(access_log_path(log_file));
+    let ids = horcrux::audit::shard_ids(shard_paths)?;
+    let history = log.read_all()?;
+    let now = horcrux::audit::now_ms();
+    let attempt: u64 = rand::random();
+
+    match Scorer::new().assess(&history, &ids, now) {
+        Verdict::Block(reasons) => {
+            log.append(&Entry::blocked(now, attempt))?;
+            let msg = reasons.join("; ");
+            if !force {
+                anyhow::bail!(horcrux::error::Error::Blocked(msg));
+            }
+            println!("Audit: BLOCKED (overridden by --force) — {msg}");
+        }
+        Verdict::Warn(reasons) => println!("Audit: WARN — {}", reasons.join("; ")),
+        Verdict::Allow => {}
+    }
+    Ok((log, attempt))
+}
+
+/// Resolve the access log path: `--log-file`, else `$HORCRUX_ACCESS_LOG`,
+/// else the default `./horcrux-access.log`.
+fn access_log_path(flag: Option<PathBuf>) -> PathBuf {
+    flag.or_else(|| std::env::var_os("HORCRUX_ACCESS_LOG").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("horcrux-access.log"))
 }
 
 /// Parse a hex-encoded secp256k1 private key (32 bytes), tolerating a 0x

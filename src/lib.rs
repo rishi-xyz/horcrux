@@ -3,6 +3,7 @@
 //! (Argon2id + AES-256-GCM), reconstruct the seed from any threshold subset of
 //! shard files, and sign Solana transactions.
 
+pub mod audit;
 pub mod chain;
 pub mod crypto;
 pub mod error;
@@ -97,6 +98,39 @@ pub fn init_shards(
 /// Note: the reconstructed [`SecretKey`] is returned for the caller to use
 /// and wipe; the intermediate share values are zeroized automatically.
 pub fn reconstruct(shard_paths: &[PathBuf], passwords: &[String]) -> Result<SecretKey, Error> {
+    reconstruct_inner(shard_paths, passwords, |_, _| {})
+}
+
+/// Reconstruct a private key from shard files, recording each shard's
+/// decryption outcome in an [`audit::AccessLog`].
+///
+/// Logging is best-effort: a failure to write a log entry does not abort the
+/// reconstruction. The caller is responsible for pre-flight scoring via
+/// [`audit::Scorer`] before invoking this.
+pub fn reconstruct_with_audit(
+    shard_paths: &[PathBuf],
+    passwords: &[String],
+    log: &audit::AccessLog,
+    attempt: u64,
+) -> Result<SecretKey, Error> {
+    let ts = audit::now_ms();
+    reconstruct_inner(shard_paths, passwords, |id, ok| {
+        let entry = if ok {
+            audit::Entry::ok(ts, attempt, id)
+        } else {
+            audit::Entry::fail(ts, attempt, id)
+        };
+        let _ = log.append(&entry);
+    })
+}
+
+/// Shared implementation of [`reconstruct`], invoking `on_shard` with the id
+/// and outcome of each shard decryption.
+fn reconstruct_inner(
+    shard_paths: &[PathBuf],
+    passwords: &[String],
+    mut on_shard: impl FnMut(u8, bool),
+) -> Result<SecretKey, Error> {
     if passwords.len() != shard_paths.len() {
         return Err(Error::InvalidParams(format!(
             "expected {} passwords, got {}",
@@ -130,7 +164,16 @@ pub fn reconstruct(shard_paths: &[PathBuf], passwords: &[String]) -> Result<Secr
 
     let mut shares = Vec::with_capacity(shards.len());
     for (shard, password) in shards.iter().zip(passwords) {
-        let value = shard.decrypt(password)?;
+        let value = match shard.decrypt(password) {
+            Ok(v) => {
+                on_shard(shard.id, true);
+                v
+            }
+            Err(e) => {
+                on_shard(shard.id, false);
+                return Err(e);
+            }
+        };
         let value_bytes: [u8; SHARE_VALUE_LEN] = value
             .as_slice()
             .try_into()
