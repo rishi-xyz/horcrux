@@ -1,12 +1,15 @@
 //! horcrux — split an Ed25519 signing seed via Shamir's Secret Sharing (over the
 //! secp256k1 field), encrypt the shares with per-shard guardian passwords
 //! (Argon2id + AES-256-GCM), reconstruct the seed from any threshold subset of
-//! shard files, and sign Solana transactions.
+//! shard files, and sign Solana transactions. Mode B adds FROST threshold
+//! signatures (`src/mpc.rs`): the same seed is dealer-split into key shares so
+//! signing never reconstructs the key on any machine.
 
 pub mod audit;
 pub mod chain;
 pub mod crypto;
 pub mod error;
+pub mod mpc;
 pub mod shard;
 pub mod sss;
 pub mod tx;
@@ -222,6 +225,34 @@ pub fn sign_transaction_from_shards(
 ) -> Result<SignedOutput, Error> {
     let key = reconstruct(shard_paths, passwords)?;
     let signed = tx::sign_transaction(*key_seed(&key), params)?;
+    Ok(signed.into())
+}
+
+/// Sign a transaction with a threshold FROST subset of share files (Mode B),
+/// without ever reconstructing the signing key.
+///
+/// The message is the bincode serialization of the transaction, exactly as
+/// Mode A signs it. The aggregated signature verifies under plain Ed25519, so
+/// the resulting transaction is indistinguishable from one signed by the full
+/// key.
+pub fn sign_transaction_from_mpc_shares(
+    share_paths: &[PathBuf],
+    passwords: &[String],
+    group_pub_path: &Path,
+    params: TxParams,
+) -> Result<SignedOutput, Error> {
+    let message = tx::transaction_message(&params);
+    let mpc::MpcSignature {
+        signature,
+        verifying_key,
+    } = mpc::mpc_sign(
+        share_paths,
+        passwords,
+        group_pub_path,
+        &message.serialize(),
+        |_, _| {},
+    )?;
+    let signed = tx::sign_transaction_with_signature(params, signature, verifying_key)?;
     Ok(signed.into())
 }
 

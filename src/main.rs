@@ -90,6 +90,65 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Dealer-split a key into encrypted FROST key shares (Mode B). Signing
+    /// later combines a threshold subset of these shares without ever
+    /// reconstructing the key.
+    MpcSplit {
+        /// Shares required to sign.
+        #[arg(long, default_value_t = 2)]
+        threshold: u8,
+        /// Total number of key shares to create.
+        #[arg(long, default_value_t = 3)]
+        shares: u8,
+        /// The private key as hex (64 hex chars, optional 0x prefix).
+        #[arg(long, conflicts_with = "generate")]
+        key_hex: Option<String>,
+        /// Generate a random disposable test key and print it once.
+        #[arg(long)]
+        generate: bool,
+        /// Directory to write share files and group.pub into.
+        #[arg(long, default_value = "mpc")]
+        out_dir: PathBuf,
+        /// Use this password for every share (else prompt per share).
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Sign a Solana transaction with a threshold FROST subset of key shares,
+    /// optionally broadcasting to a cluster (Mode B).
+    MpcSign {
+        /// Paths of the FROST share files to combine.
+        #[arg(required = true)]
+        shares: Vec<PathBuf>,
+        /// Directory containing the group public key package (group.pub).
+        #[arg(long, default_value = "mpc")]
+        group_dir: PathBuf,
+        /// Use this password for every share (else prompt per share).
+        #[arg(long)]
+        password: Option<String>,
+        /// Recipient address (base58).
+        #[arg(long)]
+        to: String,
+        /// Amount to send, in lamports (1 SOL = 1_000_000_000 lamports).
+        #[arg(long)]
+        lamports: u64,
+        /// Recent blockhash (base58). Required offline; fetched from the
+        /// cluster when broadcasting.
+        #[arg(long)]
+        blockhash: Option<String>,
+        /// Solana JSON-RPC endpoint (overrides $HORCRUX_RPC_URL).
+        #[arg(long)]
+        rpc_url: Option<String>,
+        /// Broadcast the signed transaction and wait for confirmation.
+        #[arg(long)]
+        broadcast: bool,
+        /// Access log file (default: ./horcrux-access.log or
+        /// $HORCRUX_ACCESS_LOG).
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+        /// Bypass audit blocking (blocked attempts are still logged).
+        #[arg(long)]
+        force: bool,
+    },
     /// Show the access log.
     Log {
         /// Access log file (default: ./horcrux-access.log or
@@ -147,6 +206,49 @@ async fn main() -> anyhow::Result<()> {
                 println!("  {}", path.display());
             }
         }
+        Command::MpcSplit {
+            threshold,
+            shares,
+            key_hex,
+            generate,
+            out_dir,
+            password,
+        } => {
+            let key = match (&key_hex, generate) {
+                (Some(hex_key), _) => parse_key(hex_key)?,
+                (None, true) => {
+                    let key = SecretKey::random(&mut OsRng);
+                    println!("Generated test key: 0x{}", hex::encode(key.to_bytes()));
+                    key
+                }
+                (None, false) => {
+                    anyhow::bail!("provide either --key-hex or --generate");
+                }
+            };
+
+            let passwords = collect_passwords(
+                shares as usize,
+                password,
+                &|i, n| format!("Password for share {} of {n}: ", i + 1),
+                true,
+            )?;
+
+            let (paths, group_path) =
+                horcrux::mpc::mpc_split(&key, threshold, shares, &out_dir, &passwords)?;
+            println!(
+                "Wrote {n} FROST key shares to {dir} (threshold {t}):",
+                n = paths.len(),
+                dir = out_dir.display(),
+                t = threshold
+            );
+            for path in &paths {
+                println!("  {}", path.display());
+            }
+            println!("Group public package: {}", group_path.display());
+            println!(
+                "Note: signing combines a threshold subset of these shares and never reconstructs the key."
+            );
+        }
         Command::Reconstruct {
             shards,
             password,
@@ -166,7 +268,8 @@ async fn main() -> anyhow::Result<()> {
                 false,
             )?;
 
-            let (access_log, attempt) = audit_preflight(&shards, log_file, force)?;
+            let (access_log, attempt) =
+                audit_preflight(horcrux::audit::shard_ids(&shards)?, log_file, force)?;
             let key = reconstruct_with_audit(&shards, &passwords, &access_log, attempt)?;
             println!("Reconstructed key: 0x{}", hex::encode(key.to_bytes()));
         }
@@ -223,7 +326,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
-            let (access_log, attempt) = audit_preflight(&shards, log_file, force)?;
+            let (access_log, attempt) =
+                audit_preflight(horcrux::audit::shard_ids(&shards)?, log_file, force)?;
             let key = reconstruct_with_audit(&shards, &passwords, &access_log, attempt)?;
             let seed = horcrux::key_seed(&key);
             let from = derive_address(&seed);
@@ -262,6 +366,114 @@ async fn main() -> anyhow::Result<()> {
                 println!("Mined:     {signature} (confirmed)");
             }
         }
+        Command::MpcSign {
+            shares,
+            group_dir,
+            password,
+            to,
+            lamports,
+            blockhash,
+            rpc_url,
+            broadcast,
+            log_file,
+            force,
+        } => {
+            let passwords = collect_passwords(
+                shares.len(),
+                password,
+                &|i, _| {
+                    let name = shares[i]
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    format!("Password for {name}: ")
+                },
+                false,
+            )?;
+
+            let to: solana_pubkey::Pubkey = to
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid --to address: {e}"))?;
+
+            let rpc_url = rpc_url.unwrap_or_else(horcrux::chain::default_rpc_url);
+            let chain = if broadcast {
+                println!("Broadcasting via {rpc_url}");
+                Some(horcrux::chain::Chain::connect(&rpc_url))
+            } else {
+                None
+            };
+
+            let blockhash: solana_hash::Hash = match blockhash {
+                Some(bh) => bh
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid --blockhash: {e}"))?,
+                None => {
+                    let chain = chain.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "offline signing requires --blockhash; \
+                             use --broadcast to fetch it from the cluster"
+                        )
+                    })?;
+                    let blockhash = chain.latest_blockhash().await?;
+                    println!("Resolved: latest blockhash {blockhash}");
+                    blockhash
+                }
+            };
+
+            let group_pub = group_dir.join(horcrux::mpc::GROUP_PUB_FILENAME);
+            let verifying_key: [u8; 32] = horcrux::mpc::group_verifying_key(&group_pub)?;
+            let from = solana_pubkey::Pubkey::from(verifying_key);
+
+            let (access_log, attempt) =
+                audit_preflight(horcrux::mpc::shard_ids(&shares)?, log_file, force)?;
+
+            if let Some(chain) = &chain {
+                let balance = chain.balance(&from).await?;
+                println!("Balance:  {balance} lamports");
+                if balance == 0 {
+                    anyhow::bail!(
+                        "sender {from} is unfunded; airdrop lamports first \
+                         (localnet/devnet: `solana airdrop 1 {from}`)"
+                    );
+                }
+            }
+
+            let params = TxParams {
+                from,
+                to,
+                lamports,
+                blockhash,
+            };
+            let message = horcrux::tx::transaction_message(&params);
+            let message_bytes = message.serialize();
+            let sig = horcrux::mpc::mpc_sign_with_audit(
+                &shares,
+                &passwords,
+                &group_pub,
+                &message_bytes,
+                &access_log,
+                attempt,
+            )?;
+            let signed = horcrux::tx::sign_transaction_with_signature(
+                params,
+                sig.signature,
+                sig.verifying_key,
+            )?;
+            println!("From:      {}", signed.from());
+            println!("Signature: {}", signed.signature());
+            println!("Raw:       {}", signed.raw_base58());
+
+            if let Some(chain) = chain {
+                let signature = horcrux::chain::broadcast(
+                    chain.client(),
+                    signed.tx(),
+                    std::time::Duration::from_secs(1),
+                    60,
+                )
+                .await?;
+                println!("Mined:     {signature} (confirmed)");
+            }
+        }
         Command::Log {
             log_file,
             tail,
@@ -283,6 +495,7 @@ async fn main() -> anyhow::Result<()> {
                         horcrux::audit::EntryKind::DecryptOk => "ok",
                         horcrux::audit::EntryKind::DecryptFail => "fail",
                         horcrux::audit::EntryKind::Blocked => "blocked",
+                        horcrux::audit::EntryKind::Signed => "signed",
                     };
                     println!(
                         "{}  {kind:<7}  shard {:>2}",
@@ -299,17 +512,18 @@ async fn main() -> anyhow::Result<()> {
 /// Run the audit pre-flight check: score the proposed attempt against the
 /// access log and either refuse (unless `--force`), warn, or allow it.
 ///
-/// Returns the opened [`horcrux::audit::AccessLog`] and the attempt id shared
-/// by every entry logged for this invocation.
+/// `ids` are the share/participant ids involved in the attempt, `log_file` the
+/// access log path (or `None` for the default), and `force` whether to override
+/// a blocking verdict. Returns the opened [`horcrux::audit::AccessLog`] and the
+/// attempt id shared by every entry logged for this invocation.
 fn audit_preflight(
-    shard_paths: &[PathBuf],
+    ids: Vec<u8>,
     log_file: Option<PathBuf>,
     force: bool,
 ) -> anyhow::Result<(horcrux::audit::AccessLog, u64)> {
     use horcrux::audit::{Entry, Scorer, Verdict};
 
     let log = horcrux::audit::AccessLog::open(access_log_path(log_file));
-    let ids = horcrux::audit::shard_ids(shard_paths)?;
     let history = log.read_all()?;
     let now = horcrux::audit::now_ms();
     let attempt: u64 = rand::random();

@@ -87,6 +87,14 @@ pub fn derive_address(seed: &[u8; 32]) -> Pubkey {
     Pubkey::from(signing_key.verifying_key().to_bytes())
 }
 
+/// Build the [`Message`] for a transfer described by `params`. This is the
+/// exact message whose bincode serialization is signed.
+pub fn transaction_message(params: &TxParams) -> Message {
+    let instruction =
+        solana_system_interface::instruction::transfer(&params.from, &params.to, params.lamports);
+    Message::new_with_blockhash(&[instruction], Some(&params.from), &params.blockhash)
+}
+
 /// Sign a Solana transfer for `seed` entirely offline.
 ///
 /// The seed is consumed; the only in-memory copy of the key lives inside the
@@ -102,10 +110,7 @@ pub fn sign_transaction(mut seed: [u8; 32], params: TxParams) -> Result<SignedTx
         )));
     }
 
-    let instruction =
-        solana_system_interface::instruction::transfer(&params.from, &params.to, params.lamports);
-    let message =
-        Message::new_with_blockhash(&[instruction], Some(&params.from), &params.blockhash);
+    let message = transaction_message(&params);
     let sign_bytes = message.serialize();
 
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
@@ -119,6 +124,49 @@ pub fn sign_transaction(mut seed: [u8; 32], params: TxParams) -> Result<SignedTx
 
     seed.zeroize();
 
+    Ok(SignedTx {
+        from,
+        tx: Transaction {
+            signatures: vec![signature],
+            message,
+        },
+        signature,
+    })
+}
+
+/// Assemble a signed transaction from an externally produced Ed25519 signature
+/// (e.g. a FROST-aggregated signature from [`crate::mpc`]).
+///
+/// The signature is verified against the serialized message before the
+/// transaction is returned, so an invalid aggregate cannot yield a
+/// broadcastable transaction.
+pub fn sign_transaction_with_signature(
+    params: TxParams,
+    signature: [u8; 64],
+    verifying_key: [u8; 32],
+) -> Result<SignedTx, Error> {
+    let from = Pubkey::from(verifying_key);
+    if params.from != from {
+        return Err(Error::Tx(format!(
+            "derived address {from} does not match --from {}",
+            params.from
+        )));
+    }
+
+    let message = transaction_message(&params);
+    let sign_bytes = message.serialize();
+
+    use ed25519_dalek::Verifier as _;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&verifying_key)
+        .map_err(|e| Error::Tx(format!("invalid verifying key: {e}")))?;
+    let dalek_sig = ed25519_dalek::Signature::from_bytes(&signature);
+    if vk.verify(&sign_bytes, &dalek_sig).is_err() {
+        return Err(Error::Tx(
+            "signature failed local verification against the serialized message".into(),
+        ));
+    }
+
+    let signature = Signature::from(signature);
     Ok(SignedTx {
         from,
         tx: Transaction {

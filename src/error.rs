@@ -36,6 +36,14 @@ pub enum Error {
     #[error("shard {path:?} has different split parameters (t={t}, n={n})")]
     SplitMismatch { path: PathBuf, t: u8, n: u8 },
 
+    /// A FROST share from a different group was mixed into the signing set.
+    #[error("share {path:?} belongs to a different FROST group")]
+    MpcGroupMismatch { path: PathBuf },
+
+    /// A FROST (Mode B) operation failed.
+    #[error("mpc error: {0}")]
+    Mpc(String),
+
     /// The underlying secret-sharing library failed.
     #[error("secret-sharing error: {0}")]
     Vsss(String),

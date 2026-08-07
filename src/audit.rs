@@ -25,6 +25,8 @@ pub enum EntryKind {
     DecryptFail,
     /// The attempt was blocked by the audit layer before any decryption.
     Blocked,
+    /// A signing operation completed successfully. `shard_id` is `0`.
+    Signed,
 }
 
 /// A single JSON-lines record in the access log.
@@ -71,6 +73,16 @@ impl Entry {
             attempt,
             shard_id: 0,
             kind: EntryKind::Blocked,
+        }
+    }
+
+    /// A completed signing operation.
+    pub fn signed(ts: u64, attempt: u64) -> Self {
+        Self {
+            ts,
+            attempt,
+            shard_id: 0,
+            kind: EntryKind::Signed,
         }
     }
 }
@@ -254,7 +266,7 @@ impl Scorer {
             }
             match e.kind {
                 EntryKind::DecryptFail => count += 1,
-                EntryKind::DecryptOk => break,
+                EntryKind::DecryptOk | EntryKind::Signed => break,
                 EntryKind::Blocked => {}
             }
         }
@@ -271,7 +283,7 @@ impl Scorer {
                 EntryKind::DecryptOk | EntryKind::DecryptFail => {
                     per_attempt.entry(e.attempt).or_default().insert(e.shard_id);
                 }
-                EntryKind::Blocked => {}
+                EntryKind::Blocked | EntryKind::Signed => {}
             }
         }
         if per_attempt.values().all(|ids| ids.is_empty()) {
@@ -468,6 +480,7 @@ mod tests {
         log.append(&Entry::ok(1, 9, 2)).expect("append");
         log.append(&Entry::fail(2, 9, 3)).expect("append");
         log.append(&Entry::blocked(3, 10)).expect("append");
+        log.append(&Entry::signed(4, 9)).expect("append");
 
         let all = log.read_all().expect("read");
         assert_eq!(
@@ -475,12 +488,13 @@ mod tests {
             vec![
                 Entry::ok(1, 9, 2),
                 Entry::fail(2, 9, 3),
-                Entry::blocked(3, 10)
+                Entry::blocked(3, 10),
+                Entry::signed(4, 9)
             ]
         );
         assert_eq!(
             log.tail(2).expect("tail"),
-            vec![Entry::fail(2, 9, 3), Entry::blocked(3, 10)]
+            vec![Entry::blocked(3, 10), Entry::signed(4, 9)]
         );
     }
 
