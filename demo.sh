@@ -285,4 +285,4 @@ if [[ "$run_tests" == 1 ]]; then
 fi
 printf '%s\n' "---"
 info "That is Phase 1 end to end. Next up: Phase 2 -- 'sign' (reconstruct in RAM,"
-info "build and broadcast an EVM transaction via alloy)."
+info "build a Solana transaction offline and optionally broadcast it)."

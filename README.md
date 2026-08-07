@@ -126,14 +126,13 @@ Guardians collaboratively generate a valid ECDSA signature.
 
 ---
 
-## Ethereum Compatible
+## Solana Compatible
 
 Uses
 
-- secp256k1
-- Standard ECDSA
-- Compatible with Ethereum
-- Compatible with every EVM chain
+- Ed25519 for signing
+- secp256k1 field for Shamir secret sharing
+- Compatible with Solana (local validator, devnet)
 
 ---
 
@@ -168,7 +167,7 @@ The primary objectives are:
 - Encrypt every shard independently.
 - Support offline signing.
 - Support threshold MPC signing.
-- Preserve compatibility with Ethereum.
+- Preserve compatibility with Solana (Ed25519).
 - Detect suspicious access behavior.
 - Maintain complete self custody.
 
@@ -490,9 +489,9 @@ Each module has a clearly defined responsibility to simplify auditing, testing, 
 | Encryption | AES-256-GCM |
 | Password KDF | Argon2id |
 | Zeroization | zeroize |
-| Elliptic Curve | secp256k1 |
-| EVM Integration | alloy |
-| MPC | CGGMP21 |
+| Elliptic Curve | Ed25519 (signing), secp256k1 (Shamir field) |
+| Chain Integration | solana-rpc-client (3.x split crates) |
+| MPC | FROST (frost-ed25519) |
 | AI | Isolation Forest |
 | Serialization | serde |
 | Storage | Binary Shard Files |
@@ -676,7 +675,7 @@ Example
 horcrux init \
     --threshold 2 \
     --shares 3 \
-    --output ./usb
+    --out-dir ./usb
 ```
 
 Process
@@ -706,46 +705,41 @@ Destroy Original Key
 ## Sign
 
 Mode A signing: decrypt a threshold of shards, reconstruct the key in RAM, build and
-sign an EVM transaction, wipe the key, and output the signed transaction.
+sign a Solana transaction offline, wipe the key, and output the signed transaction.
 
 ```bash
 horcrux sign \
-    --shard ./usb/shard-1.hx --password guardian-1 \
-    --shard ./usb/shard-2.hx --password guardian-2 \
-    --to 0xRecipientAddress \
-    --value 0.001 \
-    --nonce 0 \
-    --gas 21000 \
-    --max-fee-per-gas 20 \
-    --max-priority-fee-per-gas 1
+    ./usb/shard-1.hx ./usb/shard-2.hx \
+    --password guardian \
+    --to RecipientAddressBase58 \
+    --lamports 1000000000 \
+    --blockhash <recent-base58-blockhash>
 ```
 
-EIP-1559 fees are the default. Legacy transactions use `--gas-price` instead
-(conflicts with the EIP-1559 flags):
+(`--password` applies to every shard; omit it to be prompted per shard.)
+
+- Required: `--to` (base58), `--lamports` (1 SOL = 1_000_000_000 lamports), and
+  `--blockhash`. A blockhash must be supplied offline; it is only valid for the
+  block window in which it was produced, so fetch a fresh one at signing time
+  (e.g. `solana blockhash`).
+- Optional: `--rpc-url` (overrides `$HORCRUX_RPC_URL`, default
+  `http://127.0.0.1:8899`) and `--broadcast`.
+
+Broadcast to the cluster (local validator by default), fetching the latest
+blockhash and waiting for confirmation:
 
 ```bash
+HORCRUX_RPC_URL=http://127.0.0.1:8899 \
 horcrux sign \
-    --shard ./usb/shard-1.hx --password guardian-1 \
-    --shard ./usb/shard-2.hx --password guardian-2 \
-    --to 0xRecipientAddress --value 0.001 \
-    --nonce 0 --gas 21000 --gas-price 5
-```
-
-- Required: `--to`, `--value`, `--nonce`, `--gas`, and one fee model.
-- Optional: `--calldata` (hex), `--chain-id` (default Sepolia `11155111`),
-  `--from` (skips nonce check), and `--broadcast`.
-
-Broadcast to an EVM RPC (Sepolia by default), fetching any missing fields and
-waiting for the receipt:
-
-```bash
-HORCRUX_RPC_URL=https://rpc.sepolia.org \
-horcrux sign \
-    --shard ./usb/shard-1.hx --password guardian-1 \
-    --shard ./usb/shard-2.hx --password guardian-2 \
-    --to 0xRecipientAddress --value 0.001 \
+    ./usb/shard-1.hx ./usb/shard-2.hx \
+    --password guardian \
+    --to RecipientAddressBase58 \
+    --lamports 1000000000 \
     --broadcast
 ```
+
+The sender address is derived from the reconstructed key; when broadcasting,
+its balance is checked (airdrop lamports first with `solana airdrop 1 <addr>`).
 
 Output
 
@@ -754,7 +748,7 @@ Signed Transaction
 
 ↓
 
-Raw Hex
+Raw Base58 (bincode)
 
 ↓
 
@@ -858,7 +852,7 @@ curve = "secp256k1"
 
 mode = "offline"
 
-rpc = "https://rpc.sepolia.org"
+rpc = "http://127.0.0.1:8899"
 
 logging = true
 
@@ -1033,29 +1027,15 @@ Release
 
 ---
 
-## secp256k1
+## Ed25519
 
 Used for
 
-- Ethereum
-
-- Polygon
-
-- BNB Chain
-
-- Avalanche C-Chain
-
-- Base
-
-- Arbitrum
-
-- Optimism
-
-- Every EVM compatible chain
+- Solana (native Ed25519 signatures)
 
 ---
 
-## CGGMP21 Threshold ECDSA
+## FROST Threshold Ed25519
 
 Mode B implements threshold signing.
 
@@ -1084,16 +1064,16 @@ Coordinator
 
 ↓
 
-ECDSA Signature
+Ed25519 Signature
 ```
 
 Advantages
 
 ✔ Key never reconstructed
 
-✔ Standard ECDSA output
+✔ Standard Ed25519 output
 
-✔ Compatible with existing wallets
+✔ Compatible with Solana signatures
 
 ✔ No blockchain modifications
 
@@ -1341,8 +1321,8 @@ Please ensure
 The implementation and design are based on established cryptographic research, including:
 
 - Adi Shamir — *How to Share a Secret* (1979)
-- Gennaro & Goldfeder — Threshold ECDSA (GG18)
-- Canetti et al. — CGGMP21 Threshold ECDSA
+- Komlo & Goldberg — FROST: Round-Optimal Schnorr Threshold Signatures
+- Zcash Foundation — frost-ed25519 (NCC-audited, v3.0.0)
 - Park et al. — Cryptocurrency Wallet Security Survey
 - Li et al. — Distributed HSM-Based Key Management
 
