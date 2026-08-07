@@ -44,7 +44,7 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Failed to build, sign, or encode an EVM transaction.
+    /// Failed to build, sign, or broadcast a Solana transaction.
     #[error("transaction error: {0}")]
     Tx(String),
 }

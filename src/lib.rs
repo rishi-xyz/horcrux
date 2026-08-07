@@ -1,6 +1,7 @@
-//! horcrux — split a secp256k1 private key via Shamir's Secret Sharing, encrypt
-//! the shares with per-shard guardian passwords (Argon2id + AES-256-GCM), and
-//! reconstruct the key from any threshold subset of shard files.
+//! horcrux — split an Ed25519 signing seed via Shamir's Secret Sharing (over the
+//! secp256k1 field), encrypt the shares with per-shard guardian passwords
+//! (Argon2id + AES-256-GCM), reconstruct the seed from any threshold subset of
+//! shard files, and sign Solana transactions.
 
 pub mod chain;
 pub mod crypto;
@@ -143,21 +144,27 @@ pub fn reconstruct(shard_paths: &[PathBuf], passwords: &[String]) -> Result<Secr
 #[derive(Debug, Clone)]
 pub struct SignedOutput {
     /// Sender address (derived from the reconstructed key).
-    pub from: alloy::primitives::Address,
-    /// Transaction hash (keccak of the EIP-2718 encoding).
-    pub tx_hash: alloy::primitives::B256,
-    /// Raw EIP-2718 encoding as a `0x`-prefixed hex string.
-    pub raw_hex: String,
+    pub from: solana_pubkey::Pubkey,
+    /// Ed25519 signature (also the Solana transaction id).
+    pub signature: solana_signature::Signature,
+    /// Raw bincode transaction encoding as a base58 string.
+    pub raw_base58: String,
 }
 
 impl From<SignedTx> for SignedOutput {
     fn from(signed: SignedTx) -> Self {
         Self {
             from: signed.from(),
-            tx_hash: signed.tx_hash(),
-            raw_hex: signed.raw_hex(),
+            signature: signed.signature(),
+            raw_base58: signed.raw_base58(),
         }
     }
+}
+
+/// Extract the 32-byte Ed25519 seed from a reconstructed key. The returned
+/// buffer is wiped on drop.
+pub fn key_seed(key: &SecretKey) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(key.to_bytes().into())
 }
 
 /// Reconstruct the key from shards and sign a transaction entirely offline
@@ -171,7 +178,7 @@ pub fn sign_transaction_from_shards(
     params: TxParams,
 ) -> Result<SignedOutput, Error> {
     let key = reconstruct(shard_paths, passwords)?;
-    let signed = tx::sign_transaction(key, params)?;
+    let signed = tx::sign_transaction(*key_seed(&key), params)?;
     Ok(signed.into())
 }
 

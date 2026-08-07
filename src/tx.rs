@@ -102,12 +102,10 @@ pub fn sign_transaction(mut seed: [u8; 32], params: TxParams) -> Result<SignedTx
         )));
     }
 
-    let instruction = solana_system_interface::instruction::transfer(
-        &params.from,
-        &params.to,
-        params.lamports,
-    );
-    let message = Message::new_with_blockhash(&[instruction], Some(&params.from), &params.blockhash);
+    let instruction =
+        solana_system_interface::instruction::transfer(&params.from, &params.to, params.lamports);
+    let message =
+        Message::new_with_blockhash(&[instruction], Some(&params.from), &params.blockhash);
     let sign_bytes = message.serialize();
 
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
@@ -134,7 +132,6 @@ pub fn sign_transaction(mut seed: [u8; 32], params: TxParams) -> Result<SignedTx
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr as _;
 
     /// Foundry's well-known test private key, reused as a fixed Ed25519 seed.
     /// Never use outside tests.
@@ -181,7 +178,11 @@ mod tests {
     fn signature_is_over_serialized_message() {
         let signed = sign_transaction(TEST_SEED, params()).expect("sign");
         let sign_bytes = signed.tx().message.serialize();
-        assert!(signed.signature().verify(&signed.from().to_bytes(), &sign_bytes));
+        assert!(
+            signed
+                .signature()
+                .verify(&signed.from().to_bytes(), &sign_bytes)
+        );
     }
 
     #[test]
@@ -191,15 +192,13 @@ mod tests {
         let decoded: Transaction = bincode::deserialize(&raw).expect("deserializes");
         assert_eq!(bincode::serialize(&decoded).expect("reserializes"), raw);
         assert_eq!(decoded.signatures, signed.tx().signatures);
-        assert_eq!(
-            decoded.message.serialize(),
-            signed.tx().message.serialize()
-        );
+        assert_eq!(decoded.message.serialize(), signed.tx().message.serialize());
 
-        let from_b58: Pubkey =
-            Pubkey::from_str(&bs58::decode(signed.raw_base58()).into_vec().expect("valid base58"))
-                .expect("decodes to pubkey");
-        assert_eq!(from_b58, signed.from());
+        let from_b58 = bs58::decode(signed.raw_base58())
+            .into_vec()
+            .expect("valid base58 raw");
+        let decoded_from_b58: Transaction = bincode::deserialize(&from_b58).expect("deserializes");
+        assert_eq!(decoded_from_b58.signatures, signed.tx().signatures);
     }
 
     #[test]
