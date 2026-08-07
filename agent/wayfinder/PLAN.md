@@ -6,11 +6,11 @@
 ## Destination
 
 A working Rust CLI (`horcrux`) that: splits a private key via Shamir's Secret Sharing,
-binds encrypted shards to USB-simulated paths, signs and broadcasts an EVM transaction
-in two modes (Mode A: air-gapped RAM reconstruction, Mode B: true threshold-ECDSA MPC
-where the key is never assembled anywhere), and flags anomalous access attempts via a
-lightweight anomaly-detection layer. Every phase below ends in something you can
-literally run and show someone.
+binds encrypted shards to USB-simulated paths, signs and broadcasts a **Solana**
+transaction in two modes (Mode A: air-gapped RAM reconstruction, Mode B: true
+threshold-signing MPC where the key is never assembled anywhere), and flags anomalous
+access attempts via a lightweight anomaly-detection layer. Every phase below ends in
+something you can literally run and show someone.
 
 ---
 
@@ -42,10 +42,11 @@ literally run and show someone.
 | SSS | `vsss-rs` | Already named in your own lit review table |
 | Shard encryption | `aes-gcm` + `argon2` crates | AES-256-GCM + Argon2id as specced |
 | Memory wipe | `zeroize` | Standard, well-audited zeroing crate |
-| secp256k1 signing | `k256` (pure Rust) | No C bindings to fight with |
-| Chain interaction | `alloy` — **not** `ethers-rs` | ethers-rs is deprecated; alloy is its successor |
-| Testnet | Sepolia (assumption — swap freely) | Free faucet, EVM-standard |
-| Threshold ECDSA (Mode B) | `cggmp21` crate (LFDT-Lockness / ex-DFNS) | Audited by Kudelski Security, production-used, supports general t-of-n |
+| Key seed & field | `k256` (pure Rust) | Still the SSS field (math-only choice, Phase 1 unchanged) |
+| Ed25519 signing | `ed25519-dalek` | Solana's native signature scheme; `verify_strict` rejects malleated sigs |
+| Chain interaction | `solana-rpc-client` (3.x split crates) | The supported post-`solana-sdk`-umbrella layout for RPC |
+| Testnet | **localnet** (`solana-test-validator`) default; devnet via `--rpc-url` | Runs locally with pre-funded keypair, no faucet needed |
+| Threshold MPC (Mode B) | `frost-ed25519` (Zcash Foundation) | NCC-audited FROST over Ed25519; produces a plain Ed25519 signature |
 | Anomaly detection | **Open — see Phase 3** | See fog section below |
 
 ---
@@ -54,12 +55,13 @@ literally run and show someone.
 
 **Build:** Rust workspace, `cargo` project skeleton, `horcrux` binary with stub
 subcommands (`init`, `sign`, `mpc-sign`), git repo, CI running `cargo test` +
-`cargo clippy` on push, Sepolia RPC access sorted (Alchemy/Infura free tier or public RPC).
+`cargo clippy` on push, local Solana RPC access sorted (`solana-test-validator` on
+localhost, default port 8899).
 
 **AI agent fit:** near-total — this is pure boilerplate.
 
 **Visible outcome:** `cargo run -- --help` prints the full command structure; one green
-CI check; you can hit the Sepolia RPC and get back a block number.
+CI check; you can hit the local validator RPC and get back the latest blockhash.
 
 ---
 
@@ -77,29 +79,40 @@ binary file to a local path (stand-in for a USB mount).
 using any 2 via Lagrange interpolation, assert reconstructed key == original. Bonus demo:
 feed a wrong password and watch decryption fail cleanly (AES-GCM auth tag rejection).
 
+> **Field note (locked in):** the Shamir field stays secp256k1/`k256` even though signing
+> is now Ed25519. The field is a math-only choice — `vsss-rs` interpolates over any prime
+> field, and any 32 bytes is a valid Ed25519 seed. A random 32-byte seed has ~2⁻¹²⁸
+> probability of falling outside the k256 field (rejected with a clean error); generated
+> keys always succeed because `k256` samples within the field. Swap-in candidate only if a
+> reviewer objects; not planned.
+
 ---
 
-## Phase 2 — Mode A Signing + Broadcast (Week 2) [Done]
+## Phase 2 — Mode A Signing + Broadcast (Week 2) [In progress]
 
 **Build:** `horcrux sign` — take t shard paths + passwords, decrypt, reconstruct key in
-memory, build and sign a standard EVM transaction with `k256`/`alloy`, immediately
-`zeroize` the key, output signed tx hex, broadcast via `alloy` to Sepolia.
+memory, derive the Ed25519/Solana address, build an unsigned Solana `Message`
+(`system_program` transfer), sign it with `ed25519-dalek`, immediately `zeroize` the key,
+output the base58 address + signature, broadcast via `solana-rpc-client` to localnet.
 
-**AI agent fit:** medium — alloy's transaction-building API has some boilerplate an
-agent can draft, but you should personally verify the memory-wipe timing.
+**AI agent fit:** medium — the Solana 3.x split-crate API (`solana-message`,
+`solana-transaction`, `solana-system-interface`, `solana-rpc-client`) has boilerplate an
+agent can draft, but you should personally verify the memory-wipe timing and that the
+signature is over `message.hash()` — not the bincode message bytes.
 
 **Visible outcome — your real milestone:** live demo. Two of three shard files +
-passwords → reconstructed key in RAM → signed tx → broadcast → transaction visible and
-confirmed on Sepolia Etherscan. **At this point you have a complete, defensible project**
+passwords → reconstructed key in RAM → signed tx → broadcast → tx confirmed on the
+`solana-test-validator` log. **At this point you have a complete, defensible project**
 even if nothing below gets built.
 
-> **Status — closed** with the commits from `2fc4ac6` through the Phase 2 docs commit.
-> See [`agent/discussions/PHASE_2.md`](agent/discussions/PHASE_2.md) for the report.
-> Signing happens entirely offline (EIP-1559 by default, legacy via `--gas-price`);
-> broadcast is opt-in via `--broadcast` using `$HORCRUX_RPC_URL` (default Sepolia).
-> The `k256` zeroize caveat noted at the end of Phase 1 was resolved: `SecretKey` and
-> `ecdsa::SigningKey` zeroize the scalar on drop unconditionally, and the alloy signer
-> wrapper is compiled with its `zeroize` feature.
+> **Status — re-planned (Solana switch).** Phase 2 was originally built against EVM/`alloy`
+> (commits `2fc4ac6` → `de6de26`) and is being rewritten for Solana localnet. Key deltas:
+> no gas/nonce/chain-id — the only network input is a recent blockhash
+> (`get_latest_blockhash()`), fetched live or supplied offline via `--blockhash`. Address
+> space: seed bytes (0..32) = signing key, (32..64) = derived pubkey, (64..) = system
+> program id `11111111111111111111111111111111`. `zeroize` story: `k256::SecretKey`
+> zeroizes the scalar on drop; `ed25519-dalek`'s `SigningKey` zeroizes via its `zeroize`
+> feature.
 
 ---
 
@@ -131,24 +144,25 @@ flagged and blocked before signing proceeds.
 
 ---
 
-## Phase 4 — Mode B: True MPC via `cggmp21` (Weeks 4–6)
+## Phase 4 — Mode B: True Threshold MPC via FROST (Weeks 4–6)
 
 **This is the highest-risk phase — budget 3 weeks, not 1.**
 
-**Build:** integrate the `cggmp21` crate for threshold key generation (DKG) and threshold
-signing across N simulated guardian processes (start on localhost with different ports;
-LAN-across-machines is a stretch goal, not a requirement). Each guardian holds one shard
-as its key-share input; the coordinator combines partial signatures into a final valid
-ECDSA signature. Verify the resulting signature against the derived public key. Broadcast
-to Sepolia if time allows.
+**Build:** integrate the `frost-ed25519` crate (Zcash Foundation, NCC-audited, v3.0.0,
+published 2026-04-23) for threshold signing across N simulated guardian processes (start
+on localhost with different ports; LAN-across-machines is a stretch goal, not a
+requirement). Each guardian holds one key share; the coordinator combines partial
+signatures into a final valid Ed25519 signature — verifiable as a plain Ed25519 signature
+against the derived public key. Sign the same Solana `Message` built in Phase 2 and
+broadcast to localnet if time allows.
 
 **Fallback if DKG/networking eats week 5:** degrade to a "trusted dealer" simplification
-— use the crate's signing protocol with pre-distributed key shares (skip live
-peer-to-peer DKG). You still demonstrate the core claim — key never assembled on one
-machine — which is what actually matters for your objectives.
+— use the crate's signing protocol with pre-distributed key shares (skip live peer-to-peer
+DKG). You still demonstrate the core claim — key never assembled on one machine — which
+is what actually matters for your objectives.
 
 **AI agent fit:** low-to-medium. This is the part you need to understand deeply — expect
-to read the crate's docs and the CGGMP21 spec summary yourself, and use AI agents mainly
+to read the crate's docs and the FROST spec summary yourself, and use AI agents mainly
 for the networking/message-passing scaffolding around the crate's API, not the protocol
 logic itself.
 
@@ -174,9 +188,10 @@ clean twice in a row.
 
 **Build:** fix whatever broke during rehearsal, reconcile your written report with the
 actual implementation (your report already reads like a spec for exactly this system —
-good sign, just update anything that changed, like the `alloy` swap), prepare viva
-answers for the "why this crate/algorithm" questions (Argon2id vs PBKDF2, why an audited
-MPC crate instead of from-scratch, what the anomaly detector actually catches).
+good sign, just update anything that changed, like the EVM→Solana swap and the
+CGGMP21→FROST swap), prepare viva answers for the "why this crate/algorithm" questions
+(Argon2id vs PBKDF2, why an audited MPC crate instead of from-scratch, what the anomaly
+detector actually catches).
 
 **Visible outcome:** final report matches final code; you can answer "why" for every
 major choice without hesitating.
@@ -186,15 +201,16 @@ major choice without hesitating.
 ## Not yet specified (resolve these as you go — don't block on them now)
 
 - Anomaly detection: Python bridge vs Rust-native (decide at start of Phase 3)
-- Exact RPC provider (Alchemy / Infura / public Sepolia RPC — any works)
 - Mode B demo topology: all-localhost vs. genuinely separate machines on LAN
-- Whether to pin `cggmp21` at a stable release vs. tracking the `cggmp24` rename —
-  check this right before Phase 4 starts, not now (crate is actively evolving)
+- Solana CLI install path: `solana-install` vs `agave-install` (decide at Phase 0/2
+  demo time; `solana-test-validator` from either works)
+- Whether to pin `frost-ed25519` at 3.0.x vs. tracking newer releases (pin at 3.0.0;
+  re-check right before Phase 4 starts, not now)
 
 ## Out of scope (your own report already calls these "Future Scope" — leave them there)
 
 - GUI (Tauri desktop app)
-- Multi-chain signing (Bitcoin Schnorr, Solana Ed25519, Cosmos)
+- Multi-chain signing (Bitcoin Schnorr, Cosmos — Solana is now in scope as the primary chain)
 - Proactive secret sharing / periodic key refresh
 - QR-code based air-gapped Mode B
 - Formal third-party security audit
