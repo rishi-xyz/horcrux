@@ -13,6 +13,7 @@ pub mod mpc;
 pub mod shard;
 pub mod sss;
 pub mod tx;
+pub mod verify;
 
 use crate::error::Error;
 use crate::shard::{Shard, aad};
@@ -321,14 +322,18 @@ mod tests {
 
     #[test]
     fn shards_from_different_splits_rejected() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
         let key = SecretKey::random(&mut rand::rngs::OsRng);
         let passwords = ["one".to_string(), "two".to_string(), "three".to_string()];
 
-        let set_a = init_shards(&key, 2, 3, dir.path(), &passwords).expect("init a");
-        let set_b = init_shards(&key, 3, 3, dir.path(), &passwords).expect("init b");
+        let set_a = init_shards(&key, 2, 3, dir_a.path(), &passwords).expect("init a");
+        let set_b = init_shards(&key, 3, 3, dir_b.path(), &passwords).expect("init b");
 
         let mixed = vec![set_a[0].clone(), set_b[0].clone()];
-        assert!(reconstruct(&mixed, &passwords[..2]).is_err());
+        assert!(matches!(
+            reconstruct(&mixed, &passwords[..2]),
+            Err(Error::SplitMismatch { .. })
+        ));
     }
 }

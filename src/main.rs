@@ -162,6 +162,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Check shard/share files for structural integrity (magic, version,
+    /// length, split consistency) and, with a password, the AES-GCM
+    /// authentication tag. Read-only: never decrypts into the clear and never
+    /// touches the access log.
+    Verify {
+        /// Paths of the shard or share files to check.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// Optionally check each file's AES-GCM auth tag with this password.
+        #[arg(long)]
+        password: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -503,6 +515,44 @@ async fn main() -> anyhow::Result<()> {
                         e.shard_id
                     );
                 }
+            }
+        }
+        Command::Verify { files, password } => {
+            use horcrux::verify::{Kind, consistency_error, verify_files};
+
+            let reports = verify_files(&files, password.as_deref());
+            let kind = match reports.first().and_then(|r| r.kind) {
+                Some(Kind::Sss) => "SSS shard",
+                Some(Kind::Frost) => "FROST share",
+                None => "unknown",
+            };
+            for r in &reports {
+                let label = match r.kind {
+                    Some(Kind::Sss) => "SSS shard",
+                    Some(Kind::Frost) => "FROST share",
+                    None => "invalid",
+                };
+                let params = r
+                    .params
+                    .map(|(t, n)| format!(" (t={t}, n={n})"))
+                    .unwrap_or_default();
+                println!(
+                    "{:<8} {}{}  {}",
+                    if r.ok { "ok" } else { "FAIL" },
+                    label,
+                    params,
+                    r.path
+                );
+            }
+            if let Some(reason) = consistency_error(&reports) {
+                println!("Inconsistent set: {reason}");
+                std::process::exit(1);
+            }
+            if reports.iter().all(|r| r.ok) {
+                println!("All {} file(s) verified as {kind}.", reports.len());
+            } else {
+                println!("Verification failed for one or more files.");
+                std::process::exit(1);
             }
         }
     }

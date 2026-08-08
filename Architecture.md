@@ -2,7 +2,14 @@
 
 > Technical Architecture Documentation
 
-Version: 1.0
+Version: 2.0
+
+This document describes the system **as built** (Phases 0–4 of the build plan),
+not the original design sketch. Where the report originally targeted Ethereum
+(ECDSA, `alloy`) and an Isolation-Forest anomaly detector, the implementation
+signs **Solana** transactions with **Ed25519**, performs **Mode B** threshold
+signing with **FROST** (`frost-ed25519`), and uses a **rule-based anomaly
+scorer**. Everything below reflects the shipped code.
 
 ---
 
@@ -25,7 +32,8 @@ Version: 1.0
 15. Network Architecture
 16. Class Overview
 17. Sequence Diagrams
-18. Future Architecture
+18. Failure Scenarios
+19. Future Architecture
 
 ---
 
@@ -57,45 +65,32 @@ The system is designed to satisfy the following properties.
 
 Private keys must never be exposed unless the threshold policy is satisfied.
 
----
-
 ## Integrity
 
-Shard modification must always be detected.
-
----
+Shard modification must always be detected (AES-256-GCM authentication tags).
 
 ## Availability
 
-Loss of one guardian must not destroy the wallet.
-
----
+Loss of one guardian must not destroy the wallet (t-of-n redundancy).
 
 ## Offline Operation
 
-Critical operations should require no Internet connection.
-
----
+Signing (both modes) is fully offline; only the optional broadcast step touches
+the network.
 
 ## Self Custody
 
-No cloud providers.
-
-No centralized servers.
-
-No third-party custody.
-
----
+No cloud providers, no centralized servers, no third-party custody.
 
 ## Extensibility
 
-Each cryptographic module should be replaceable without affecting the remaining system.
+Each cryptographic module is replaceable without affecting the remaining system.
 
 ---
 
 # 3. System Overview
 
-The architecture consists of three independent operational phases.
+The architecture consists of three operational phases.
 
 ```
            Setup
@@ -107,7 +102,7 @@ The architecture consists of three independent operational phases.
     Shard Encryption
              │
              ▼
-     USB Distribution
+    USB Distribution
              │
 ─────────────┼─────────────
              │
@@ -117,6 +112,7 @@ The architecture consists of three independent operational phases.
       │               │
       ▼               ▼
     Mode A         Mode B
+   (reconstruct)   (FROST)
 ```
 
 Each phase performs one clearly defined responsibility.
@@ -146,23 +142,13 @@ Guardian3 --> Signing
 
 Signing --> Blockchain
 
-CLI --> AI
+CLI --> Audit
 
-AI --> Logs
+Audit --> AccessLog
 ```
 
----
-
-The architecture separates
-
-- cryptographic processing
-- storage
-- authentication
-- blockchain communication
-
-into independent modules.
-
-This minimizes coupling while simplifying auditing.
+The architecture separates cryptographic processing, storage, authentication,
+and blockchain communication into independent modules.
 
 ---
 
@@ -173,17 +159,16 @@ The system consists of the following logical components.
 ```
 HORCRUX
 
-├── CLI
-├── Configuration
-├── Authentication
-├── Secret Sharing
-├── Encryption
-├── USB Storage
-├── Signing Engine
-├── MPC Coordinator
-├── Blockchain Interface
-├── Logging
-└── AI Detection
+├── CLI                 (src/main.rs)
+├── Secret Sharing      (src/sss.rs, via vsss-rs)
+├── Encryption          (src/crypto.rs, Argon2id + AES-256-GCM)
+├── Shard Storage       (src/shard.rs, HX1)
+├── Mode A Signing      (src/tx.rs, ed25519-dalek)
+├── FROST MPC           (src/mpc.rs, frost-ed25519)
+├── Blockchain Access   (src/chain.rs, solana-rpc-client)
+├── Access Log / Audit  (src/audit.rs)
+├── Verification        (src/verify.rs)
+└── Error Types         (src/error.rs)
 ```
 
 Each module owns exactly one responsibility.
@@ -202,19 +187,19 @@ Responsibilities
 
 The CLI contains **no cryptographic logic**.
 
----
+Commands:
 
-# Configuration Layer
-
-Stores
-
-- threshold
-- guardian count
-- curve
-- signing mode
-- logging options
-
-Configuration is independent of shard storage.
+```
+horcrux
+├── init          split + encrypt a key into HX1 shards
+├── reconstruct   recover the key from a threshold subset
+├── sign          Mode A: reconstruct + sign a Solana transfer
+├── mpc-split     dealer-split a key into HX2 FROST key shares
+├── mpc-sign      Mode B: threshold-sign from HX2 shares
+├── verify        passive structural + auth-tag integrity check
+├── log           view the access log
+└── help
+```
 
 ---
 
@@ -224,25 +209,19 @@ Responsible for
 
 ```
 Private Key
-
-↓
-
-Polynomial Generation
-
-↓
-
+    ↓
+Polynomial Generation (over the secp256k1 field)
+    ↓
 Share Creation
-
-↓
-
-Share Reconstruction
+    ↓
+Share Reconstruction (Lagrange interpolation)
 ```
 
-Implements
+Implements Shamir Secret Sharing (`vsss-rs`) with configurable threshold values.
 
-- Shamir Secret Sharing
-
-using configurable threshold values.
+**Field note:** the Shamir field stays `k256`/secp256k1 even though signing is
+Ed25519. The field is a math-only choice; any 32 bytes is a valid Ed25519 seed,
+and `vsss-rs` interpolates over any prime field.
 
 ---
 
@@ -252,19 +231,13 @@ Responsible for
 
 ```
 Password
-
-↓
-
-Argon2id
-
-↓
-
-AES Key
+    ↓
+Argon2id (19 MiB, 2 passes, 1 lane)
+    ↓
+AES-256 key
 ```
 
-No passwords are stored.
-
-Only derived keys exist temporarily.
+No passwords are stored. Only derived keys exist temporarily.
 
 ---
 
@@ -279,24 +252,11 @@ Raw Share
 Produces
 
 ```
-Encrypted Share
-
-+
-
-Nonce
-
-+
-
-Salt
-
-+
-
-Authentication Tag
+Encrypted Share + Nonce + Salt + Authentication Tag
 ```
 
-Uses
-
-AES-256-GCM
+Uses AES-256-GCM, binding each share's threshold/share-count/id into the
+authenticated data (AAD), so a shard from another split cannot decrypt.
 
 ---
 
@@ -306,69 +266,58 @@ Responsible for
 
 ```
 Binary Serialization
-
-↓
-
-USB Writing
-
-↓
-
-USB Reading
-
-↓
-
+    ↓
+File Writing
+    ↓
+File Reading
+    ↓
 Integrity Verification
 ```
 
-Storage never accesses plaintext keys.
+Storage never accesses plaintext keys. Two on-disk formats exist (see
+§14): `HX1` for SSS shards and `HX2` for FROST key shares.
 
 ---
 
-# Signing Layer
+# Signing Layer (Mode A)
 
 Produces
 
 ```
-Transaction
-
-↓
-
-ECDSA Signature
-
-↓
-
+Transaction (system_program transfer)
+    ↓
+Ed25519 Signature (ed25519-dalek)
+    ↓
 Signed Transaction
 ```
 
-Uses
-
-- secp256k1
-- alloy
-- k256
+The bytes signed are `message.serialize()` — the bincode serialization of the
+Solana legacy message — which is exactly what the cluster receives via
+`sendTransaction`. The signing key is wiped on drop (`zeroize`).
 
 ---
 
-# MPC Layer
+# MPC Layer (Mode B)
 
-Coordinates
+Runs the two-round FROST protocol over Ed25519 (`frost-ed25519`, RFC 9591):
 
 ```
-Guardian Nodes
-
-↓
-
-Partial Signatures
-
-↓
-
+Share Files (HX2)
+    ↓
+Decrypt Each Key Share
+    ↓
+Round 1: Nonce Commitments
+    ↓
+Round 2: Signature Shares
+    ↓
 Aggregation
-
-↓
-
-ECDSA Signature
+    ↓
+Standard Ed25519 Signature
 ```
 
-The coordinator never owns the private key.
+Each share file is an independent in-process participant. The coordinator
+(aggregator) never owns the signing key, and the full key is never
+reconstructed anywhere.
 
 ---
 
@@ -378,75 +327,45 @@ Responsible only for
 
 ```
 Broadcast
-
-↓
-
+    ↓
 Transaction Hash
-
-↓
-
+    ↓
 Confirmation
 ```
 
-No wallet secrets enter this layer.
+Only signed transactions and public addresses enter this layer; no wallet
+secrets do. RPC access goes through `solana-rpc-client` (3.x split crates).
 
 ---
 
-# AI Layer
+# Audit Layer
 
-Monitors
+Records every shard decryption attempt to an **append-only** JSON-lines access
+log, then scores each new attempt before any key material is handled.
 
-```
-Access Logs
+Signals evaluated by the rule-based scorer (`src/audit.rs`):
 
-↓
+| Signal | Effect |
+|--------|--------|
+| 3+ trailing decrypt failures within the last hour | **Block** |
+| Attempt during UTC 00:00–06:00 | Warn |
+| Shard combination never used before | Warn |
+| Inter-attempt gap z-score > 3 | Warn |
 
-Feature Extraction
-
-↓
-
-Isolation Forest
-
-↓
-
-Anomaly Score
-```
-
-Alerts are generated before signing.
-
----
-
-# Logging Layer
-
-Records
-
-- timestamp
-- guardian id
-- USB id
-- result
-- anomaly score
-
-Logs never contain
-
-- passwords
-- private keys
-- decrypted shares
+Blocked attempts are themselves logged, so a refused attempt cannot hide.
+`--force` overrides a block.
 
 ---
 
 # 6. Operational Phases
 
-HORCRUX executes three distinct ceremonies.
+HORCRUX executes three ceremonies.
 
 ```
 Setup
-
-↓
-
+    ↓
 Distribution
-
-↓
-
+    ↓
 Access
 ```
 
@@ -456,80 +375,42 @@ Each ceremony has independent security guarantees.
 
 # Phase 1 — Setup Ceremony
 
-Purpose
-
-Create encrypted shards.
-
-Workflow
+Purpose: create encrypted shards.
 
 ```mermaid
 flowchart LR
 
-Key
-
--->
-
-Split
-
--->
-
-Encrypt
-
--->
-
-USB
-
--->
-
-Destroy Key
+Key --> Split --> Encrypt --> USB --> DestroyKey
 ```
 
 Steps
 
-1. User enters private key.
-
-2. Threshold parameters selected.
-
-3. Polynomial generated.
-
-4. Shares produced.
-
-5. Password derived.
-
-6. AES encryption performed.
-
-7. USB files written.
-
-8. Original key zeroized.
+1. User enters a private key (`--key-hex`) or generates a disposable one
+   (`--generate`).
+2. Threshold parameters are selected (`--threshold`/`--shares`).
+3. A random polynomial is generated over the secp256k1 field.
+4. Shares are produced.
+5. A password per shard derives an AES key (Argon2id).
+6. AES-256-GCM encryption is performed.
+7. HX1 shard files are written.
+8. The original key is zeroized.
 
 ---
 
 # Phase 2 — Distribution Ceremony
 
-Purpose
-
-Distribute trust.
+Purpose: distribute trust.
 
 ```
-Guardian A
-
-← USB 1
-
-Guardian B
-
-← USB 2
-
-Guardian C
-
-← USB 3
+Guardian A ← USB 1
+Guardian B ← USB 2
+Guardian C ← USB 3
 ```
 
 Rules
 
 - One guardian receives one shard.
-
 - Passwords remain private.
-
 - USBs are never copied digitally.
 
 ---
@@ -540,55 +421,44 @@ Two execution modes exist.
 
 ```
 Sign
-
-↓
-
-Mode A
-
-OR
-
-Mode B
+    ↓
+Mode A   OR   Mode B
 ```
 
-Selection depends on
+Selection depends on threat model, network availability, and operational
+requirements. Before either mode runs, the audit layer scores the attempt and
+may block it.
 
-- threat model
-- network availability
-- operational requirements
-
----
 ---
 
 # 7. Detailed Data Flow
 
-The complete lifecycle of a blockchain private key inside HORCRUX is illustrated below.
+The complete lifecycle of a signing seed inside HORCRUX is illustrated below.
 
 ```mermaid
 flowchart LR
 
-A[Private Key]
+A[Private Key] --> B[SSS Module]
 
--->B[SSS Module]
+B --> C1[Share 1]
+B --> C2[Share 2]
+B --> C3[Share 3]
 
-B-->C1[Share 1]
-B-->C2[Share 2]
-B-->C3[Share 3]
+C1 --> D1[AES-256-GCM]
+C2 --> D2[AES-256-GCM]
+C3 --> D3[AES-256-GCM]
 
-C1-->D1[AES-256-GCM]
-C2-->D2[AES-256-GCM]
-C3-->D3[AES-256-GCM]
+D1 --> E1[Guardian USB 1]
+D2 --> E2[Guardian USB 2]
+D3 --> E3[Guardian USB 3]
 
-D1-->E1[Guardian USB 1]
-D2-->E2[Guardian USB 2]
-D3-->E3[Guardian USB 3]
+E1 --> F[Signing Ceremony]
+E2 --> F
+E3 --> F
 
-E1-->F[Signing Ceremony]
-E2-->F
-E3-->F
+F --> G[Signed Transaction]
 
-F-->G[Signed Transaction]
-
-G-->H[Ethereum Network]
+G --> H[Solana Network]
 ```
 
 At no point are plaintext shards written to persistent storage.
@@ -615,48 +485,22 @@ Each subsystem has a single responsibility.
 ```mermaid
 graph TD
 
-CLI --> Config
-
-CLI --> Auth
-
 CLI --> SSS
-
 CLI --> Storage
-
 CLI --> Sign
-
 CLI --> MPC
-
 CLI --> Blockchain
-
-CLI --> AI
-
-Auth --> Encryption
+CLI --> Audit
 
 SSS --> Encryption
-
 Encryption --> Storage
-
 Storage --> USB
 
 Sign --> Blockchain
+MPC --> Blockchain
 
-AI --> Logs
+Audit --> Logs
 ```
-
----
-
-## CLI Module
-
-Responsibilities
-
-- Parse CLI arguments
-- Interactive prompts
-- Password collection
-- Workflow orchestration
-- Error reporting
-
-The CLI intentionally contains **no cryptographic implementation**.
 
 ---
 
@@ -666,24 +510,10 @@ Responsibilities
 
 - Generate random polynomial
 - Split secret
-- Serialize shares
 - Reconstruct secret
 - Validate threshold
 
-Input
-
-```
-32-byte Private Key
-```
-
-Output
-
-```
-Share 1
-Share 2
-...
-Share N
-```
+Input: 32-byte private key. Output: N shares.
 
 ---
 
@@ -693,25 +523,9 @@ Responsibilities
 
 - Generate salt
 - Generate nonce
-- Derive AES key
+- Derive AES key (Argon2id)
 - Encrypt shard
 - Authenticate ciphertext
-
-```text
-Password
-      │
-      ▼
- Argon2id
-      │
-      ▼
- AES Key
-      │
-      ▼
-AES-256-GCM
-      │
-      ▼
-Encrypted Shard
-```
 
 ---
 
@@ -734,24 +548,7 @@ Responsibilities
 
 - Serialize shard files
 - Read shard files
-- Verify integrity
-- USB device abstraction
-
-Expected file format
-
-```
-+---------------------+
-| Metadata            |
-+---------------------+
-| Salt                |
-+---------------------+
-| Nonce               |
-+---------------------+
-| Ciphertext          |
-+---------------------+
-| Authentication Tag  |
-+---------------------+
-```
+- Verify integrity (structure + GCM tag)
 
 ---
 
@@ -761,36 +558,29 @@ Responsibilities
 
 - Transaction construction
 - Transaction signing
-- RPC communication
+- RPC communication (fetch blockhash, check balance)
 - Broadcast
-- Receipt verification
+- Confirmation
 
 This module never receives guardian passwords.
 
 ---
 
-## AI Module
+## Audit Module
 
 Responsibilities
 
 - Parse access logs
-- Generate features
-- Run anomaly detector
-- Produce anomaly score
-
-Example features
-
-- Hour of access
-- Failed attempts
-- Guardian combination
-- Device identifiers
-- Time since previous signing
+- Generate features (hour, failures, combination, gaps)
+- Run the rule-based scorer
+- Produce an allow/warn/block verdict
 
 ---
 
 # 9. Mode A Architecture
 
-Mode A is designed for environments where complete network isolation is required.
+Mode A is designed for environments where complete network isolation is
+required.
 
 Examples
 
@@ -798,8 +588,6 @@ Examples
 - Institutional vaults
 - Air-gapped computers
 - Long-term custody
-
----
 
 ## Workflow
 
@@ -813,89 +601,54 @@ participant SSS
 participant Signer
 
 Owner->>CLI: horcrux sign
-
 CLI->>USB: Read encrypted shards
-
 USB-->>CLI: Ciphertext
-
 CLI->>CLI: Password prompt
-
 CLI->>SSS: Decrypt & reconstruct key
-
-SSS-->>Signer: Private key
-
+SSS-->>Signer: Signing seed
 Signer->>Signer: Sign transaction
-
 Signer-->>CLI: Signed transaction
-
 CLI->>CLI: Zeroize memory
-
-CLI-->>Owner: Transaction Hex
+CLI-->>Owner: Base58 address + signature + raw tx
 ```
-
----
 
 ## Internal Pipeline
 
 ```
 USB
-
-↓
-
+    ↓
 Read Shards
-
-↓
-
+    ↓
 Password Entry
-
-↓
-
+    ↓
 Argon2id
-
-↓
-
+    ↓
 AES Decryption
-
-↓
-
+    ↓
 Lagrange Reconstruction
-
-↓
-
-Private Key
-
-↓
-
-ECDSA Sign
-
-↓
-
+    ↓
+Signing Seed
+    ↓
+Ed25519 Sign
+    ↓
 Zeroize
-
-↓
-
-Broadcast
+    ↓
+Broadcast (opt-in)
 ```
-
----
 
 ## Security Characteristics
 
 Advantages
 
 - Completely offline
-
 - No network dependency
-
 - Simple operational model
-
 - Easy disaster recovery
 
 Trade-offs
 
-- Private key exists briefly in RAM
-
-- Requires trusted coordinator machine
+- Signing seed exists briefly in RAM
+- Requires a trusted coordinator machine
 
 ---
 
@@ -905,108 +658,68 @@ Trade-offs
 stateDiagram-v2
 
 [*] --> Empty
-
 Empty --> Allocate
-
 Allocate --> Reconstruct
-
 Reconstruct --> Sign
-
 Sign --> Zeroize
-
 Zeroize --> Empty
-
 Empty --> [*]
 ```
 
-The reconstructed private key exists only between **Reconstruct** and **Zeroize**.
+The reconstructed signing seed exists only between **Reconstruct** and
+**Zeroize**.
 
 ---
 
 # 10. Mode B Architecture
 
-Mode B eliminates private key reconstruction entirely.
-
-Instead of reconstructing the secret, guardian nodes cooperatively generate a valid ECDSA signature.
-
----
-
-## High-Level Architecture
+Mode B eliminates key reconstruction entirely. Instead of assembling the
+secret, share files cooperatively generate a valid Ed25519 signature via the
+two-round FROST protocol. The implementation uses the **trusted-dealer**
+variant: `horcrux mpc-split` dealer-splits the seed into key shares with
+`frost-ed25519`, and each share file acts as one in-process participant during
+`horcrux mpc-sign`.
 
 ```mermaid
 flowchart LR
 
-Coordinator
+Share1 --> Coordinator
+Share2 --> Coordinator
+Share3 --> Coordinator
 
--->Guardian1
-
-Coordinator
-
--->Guardian2
-
-Coordinator
-
--->Guardian3
-
-Guardian1
-
--->Coordinator
-
-Guardian2
-
--->Coordinator
-
-Guardian3
-
--->Coordinator
-
-Coordinator
-
--->Signature
+Coordinator --> Signature
 ```
 
----
+## Participant
 
-## Guardian Node
-
-Each guardian node performs
+Each share file contributes
 
 ```
 Read USB
-
-↓
-
+    ↓
 Password
-
-↓
-
-Decrypt Local Share
-
-↓
-
-Participate in MPC
-
-↓
-
+    ↓
+Decrypt Local Key Share
+    ↓
+Round 1: Nonce Commitment
+    ↓
+Round 2: Signature Share
+    ↓
 Destroy Local State
 ```
 
-No guardian receives another guardian's shard.
-
----
+No participant receives another participant's share.
 
 ## Coordinator
 
 Responsibilities
 
-- Session creation
-- Message routing
-- Signature aggregation
-- Failure detection
+- Decrypt each share into a participant
+- Collect nonce commitments
+- Collect signature shares
+- Aggregate into a final signature
 
-The coordinator is **not** trusted with private key material.
-
----
+The coordinator never reconstructs or holds the full signing key.
 
 ## Signing Pipeline
 
@@ -1014,55 +727,109 @@ The coordinator is **not** trusted with private key material.
 sequenceDiagram
 
 participant Coordinator
-participant Guardian1
-participant Guardian2
-participant Guardian3
+participant Share1
+participant Share2
 
-Coordinator->>Guardian1: Start Session
-Coordinator->>Guardian2: Start Session
-Coordinator->>Guardian3: Start Session
-
-Guardian1-->>Coordinator: Partial Signature
-
-Guardian2-->>Coordinator: Partial Signature
-
-Guardian3-->>Coordinator: Partial Signature
-
+Coordinator->>Share1: Decrypt key share
+Coordinator->>Share2: Decrypt key share
+Share1-->>Coordinator: Nonce commitment
+Share2-->>Coordinator: Nonce commitment
+Share1-->>Coordinator: Signature share
+Share2-->>Coordinator: Signature share
 Coordinator->>Coordinator: Aggregate
-
-Coordinator-->>Coordinator: Final Signature
+Coordinator-->>Coordinator: Standard Ed25519 signature
 ```
 
----
+## Key Properties
+
+- Because the FROST group is derived from the same 32-byte seed, the group
+  address equals the Mode A wallet address.
+- The aggregated signature is an ordinary RFC 8032 Ed25519 signature, so it
+  flows through the Mode A Solana sign/broadcast path unchanged.
+- Signatures are non-deterministic (fresh nonces per signing operation).
+- The full signing key never exists on any machine.
 
 ## Advantages
 
 - Private key never reconstructed
-
 - No single point of compromise
-
-- Standard ECDSA output
-
-- Compatible with Ethereum
-
----
+- Standard Ed25519 output
+- Compatible with Solana (and any Ed25519 verifier)
 
 ## Limitations
 
-- Requires multiple machines
+- Uses a trusted dealer at split time (dealer must destroy the key after
+  splitting)
+- Higher complexity than Mode A
+- Requires collecting a threshold of guardian passwords/shares
 
-- Network communication required
-
-- Higher implementation complexity
-
-- Longer signing ceremony
+> **DKG is explicitly out of scope** for this project (see build plan); the
+> trusted-dealer fallback preserves the core claim that the key is never
+> assembled for signing.
 
 ---
+
+# 11. Security Architecture
+
+HORCRUX follows a **defense-in-depth** model where multiple independent
+mechanisms work together.
+
+```text
+                User
+                 │
+                 ▼
+        Guardian Password
+                 │
+                 ▼
+             Argon2id
+                 │
+                 ▼
+           AES-256-GCM
+                 │
+                 ▼
+        Shamir Secret Sharing
+                 │
+                 ▼
+         Threshold Policy
+                 │
+                 ▼
+          Memory Zeroization
+                 │
+                 ▼
+         Behavioral Detection
+```
+
+No single layer is trusted on its own.
+
+## Cryptographic Layers
+
+### Layer 1 – Password Hardening
+
+Passwords are transformed into encryption keys using Argon2id.
+
+### Layer 2 – Authenticated Encryption
+
+Each shard is encrypted using AES-256-GCM. Any modification invalidates the
+authentication tag.
+
+### Layer 3 – Secret Sharing
+
+Shamir Secret Sharing distributes trust mathematically.
+
+### Layer 4 – Threshold Signing
+
+Mode B eliminates reconstruction entirely via FROST; the resulting Ed25519
+signature is identical to one produced by a conventional wallet.
+
+### Layer 5 – Memory Protection
+
+Sensitive data exists only for the minimum required duration.
+
 ---
 
-# 11. Trust Boundaries
+# 12. Trust Boundaries
 
-HORCRUX intentionally separates trust across multiple independent domains.
+HORCRUX intentionally separates trust across independent domains.
 
 ```mermaid
 flowchart TD
@@ -1085,26 +852,21 @@ end
 
 subgraph HORCRUX
 E[CLI]
-F[Authentication]
+F[Encryption]
 G[SSS]
 H[MPC]
 I[Blockchain]
-J[Logging]
+J[Audit]
 end
 
 A --> E
-
 B --> F
 C --> F
 D --> F
-
 F --> G
-
 G --> H
-
 H --> I
-
-J --> AI
+J --> AccessLog
 ```
 
 Each boundary protects against a different class of attack.
@@ -1112,205 +874,89 @@ Each boundary protects against a different class of attack.
 | Boundary | Protection |
 |-----------|------------|
 | User ↔ CLI | Hidden input, validation |
-| CLI ↔ Authentication | Password isolation |
-| Authentication ↔ Encryption | Derived keys only |
+| CLI ↔ Encryption | Password isolation |
 | Encryption ↔ Storage | Ciphertext only |
 | Storage ↔ USB | Physical isolation |
 | Signing ↔ Blockchain | Signed transactions only |
 
 ---
 
-# 12. Security Architecture
-
-HORCRUX follows a **defense-in-depth** model where multiple independent security mechanisms work together.
-
-```text
-                User
-
-                 │
-
-                 ▼
-
-        Guardian Password
-
-                 │
-
-                 ▼
-
-             Argon2id
-
-                 │
-
-                 ▼
-
-           AES-256-GCM
-
-                 │
-
-                 ▼
-
-       Shamir Secret Sharing
-
-                 │
-
-                 ▼
-
-          Threshold Policy
-
-                 │
-
-                 ▼
-
-          Memory Zeroization
-
-                 │
-
-                 ▼
-
-         Behavioral Detection
-```
-
-No single layer is trusted on its own.
-
----
-
-## Cryptographic Layers
-
-### Layer 1 – Password Hardening
-
-Passwords are transformed into encryption keys using Argon2id.
-
-Purpose
-
-- Slow brute-force attacks
-- Increase attacker cost
-- Memory hardness
-
----
-
-### Layer 2 – Authenticated Encryption
-
-Each shard is encrypted using AES-256-GCM.
-
-Provides
-
-- Confidentiality
-- Integrity
-- Authentication
-
-Any modification invalidates the authentication tag.
-
----
-
-### Layer 3 – Secret Sharing
-
-Shamir Secret Sharing distributes trust mathematically.
-
-Properties
-
-- Configurable threshold
-- Information-theoretic secrecy
-- No information leakage below threshold
-
----
-
-### Layer 4 – Threshold Signing
-
-Mode B eliminates reconstruction completely.
-
-The resulting ECDSA signature is identical to one produced by a conventional wallet.
-
----
-
-### Layer 5 – Memory Protection
-
-Sensitive data exists only for the minimum required duration.
-
-Objects protected
-
-- Passwords
-- AES keys
-- Plaintext shares
-- Reconstructed key
-- MPC intermediate values
-
----
-
 # 13. Memory Lifecycle
-
-One of HORCRUX's primary design goals is minimizing the lifetime of sensitive material.
 
 ```mermaid
 stateDiagram-v2
 
 [*] --> Allocated
-
 Allocated --> Active
-
 Active --> Signing
-
 Signing --> Zeroized
-
 Zeroized --> Released
-
 Released --> [*]
 ```
 
-Sensitive memory is explicitly overwritten before being released back to the operating system.
-
----
+Sensitive memory is explicitly overwritten before being released back to the
+operating system.
 
 ## Zeroization Policy
-
-The following objects are securely erased after use.
 
 | Object | When Destroyed |
 |----------|----------------|
 | Guardian Password | Immediately after key derivation |
 | AES Key | After shard decryption |
 | Plaintext Share | After reconstruction |
-| Private Key | Immediately after signing |
-| MPC Buffers | After protocol completion |
+| Signing Seed | Immediately after signing |
+| FROST Buffers | After protocol completion |
+
+`zeroize` covers the k256 scalar, ed25519-dalek signing keys, and the caller's
+seed buffer.
 
 ---
 
 # 14. USB Shard Format
 
-Each guardian USB stores exactly one encrypted shard.
+Each guardian USB stores exactly one encrypted shard. Two formats exist,
+distinguished by their magic bytes.
+
+## HX1 — SSS shard (83 bytes)
 
 ```
-guardian-1.hrx
-```
-
-Internal structure
-
-```text
 +-----------------------------------+
-| File Header                       |
-+-----------------------------------+
-| Version                           |
-+-----------------------------------+
-| Guardian Identifier               |
-+-----------------------------------+
-| Threshold Parameters              |
-+-----------------------------------+
-| Salt (Argon2id)                   |
-+-----------------------------------+
-| Nonce                             |
-+-----------------------------------+
-| AES-GCM Ciphertext                |
-+-----------------------------------+
-| Authentication Tag                |
-+-----------------------------------+
-| Optional Metadata                 |
+| magic "HX1"          | 0..3      |
+| format version = 1   | 3         |
+| threshold t          | 4         |
+| share count n        | 5         |
+| share id             | 6         |
+| Argon2id salt        | 7..23     |
+| AES-GCM nonce        | 23..35    |
+| sealed share value   | 35..67    |
+| GCM auth tag         | 67..83    |
 +-----------------------------------+
 ```
 
-The shard file never stores
+Written by `init`, consumed by `reconstruct`/`sign`.
 
-- plaintext private key
-- decrypted share
-- guardian password
+## HX2 — FROST key share (variable)
+
+```
++-----------------------------------+
+| magic "HX2"          | 0..3      |
+| format version = 1   | 3         |
+| min signers (t)      | 4         |
+| max signers (n)      | 5         |
+| participant id       | 6         |
+| Argon2id salt        | 7..23     |
+| AES-GCM nonce        | 23..35    |
+| sealed length (u16 LE)| 35..37    |
+| sealed KeyPackage + tag            |
++-----------------------------------+
+```
+
+Written by `mpc-split` (alongside the non-secret `group.pub`), consumed by
+`mpc-sign`. The sealed payload is the serialized FROST `KeyPackage` with the
+AES-GCM tag appended.
+
+The shard files never store the plaintext key, a decrypted share, or a
+guardian password.
 
 ---
 
@@ -1322,206 +968,195 @@ The shard file never stores
 flowchart LR
 
 USB1 --> Coordinator
-
 USB2 --> Coordinator
-
 Coordinator --> Sign
-
 Sign --> Broadcast
 ```
 
 Only one machine is required.
-
----
 
 ## Mode B
 
 ```mermaid
 flowchart LR
 
-subgraph Guardian1
-A[USB]
-end
-
-subgraph Guardian2
-B[USB]
-end
-
-subgraph Guardian3
-C[USB]
+subgraph Guardians
+A[Share 1]
+B[Share 2]
+C[Share 3]
 end
 
 subgraph Coordinator
-D[MPC Coordinator]
+D[Aggregator]
 end
 
 A --> D
-
 B --> D
-
 C --> D
-
-D --> Ethereum
+D --> Solana
 ```
 
-Every guardian operates independently.
+The shares may live on separate guardian machines; signing requires only that a
+threshold of share files be made available to the coordinator.
 
 ---
 
 # 16. Class Overview
 
-The implementation is logically organized into the following classes and modules.
+The implementation is organized into the following modules.
 
 ```mermaid
 classDiagram
 
-class HorcruxConfig
-
 class CLI
-
-class Authentication
-
 class SSSModule
-
 class Encryption
-
-class Storage
-
-class MPCCoordinator
-
-class GuardianNode
-
+class ShardFile
+class FrostShare
 class Signer
-
+class MPCAggregator
 class BlockchainClient
-
 class AccessLogger
-
-class AnomalyDetector
-
-CLI --> HorcruxConfig
-
-CLI --> Authentication
-
-Authentication --> Encryption
-
-Encryption --> Storage
+class Scorer
+class Verifier
 
 CLI --> SSSModule
-
 CLI --> Signer
+CLI --> MPCAggregator
+CLI --> BlockchainClient
+CLI --> AccessLogger
+CLI --> Verifier
 
-CLI --> MPCCoordinator
-
-Signer --> BlockchainClient
-
-AccessLogger --> AnomalyDetector
+SSSModule --> Encryption
+Encryption --> ShardFile
+MPCAggregator --> FrostShare
+AccessLogger --> Scorer
 ```
-
----
 
 ## Responsibility Matrix
 
 | Module | Responsibility |
 |---------|----------------|
 | CLI | User interaction |
-| Config | Runtime configuration |
-| Authentication | Password handling |
-| Encryption | AES-256-GCM |
+| Encryption | Argon2id + AES-256-GCM |
 | SSS | Split & reconstruct |
-| Storage | USB persistence |
-| Signer | ECDSA signing |
-| MPC Coordinator | Distributed signing |
+| Storage | HX1/HX2 persistence |
+| Signer | Ed25519 signing |
+| MPC | FROST threshold signing |
 | Blockchain | Broadcast |
 | Logger | Access history |
-| AI | Behavioral analysis |
+| Scorer | Behavioral analysis |
+| Verifier | Passive integrity checks |
 
 ---
 
-# 17. Failure Scenarios
+# 17. Sequence Diagrams
+
+## Mode A — Sign Offline
+
+```mermaid
+sequenceDiagram
+
+participant Owner
+participant CLI
+participant Audit
+participant Shards
+participant Signer
+
+Owner->>CLI: horcrux sign s1.hx s2.hx --to ... --lamports ... --blockhash ...
+CLI->>Audit: assess attempt (shard ids, time, history)
+Audit-->>CLI: allow / warn / block
+alt Blocked and not --force
+    CLI-->>Owner: refused; blocked entry logged
+else
+    CLI->>Shards: read + decrypt each shard
+    Shards-->>Audit: decrypt_ok/decrypt_fail per shard
+    CLI->>Signer: reconstruct seed, sign message
+    Signer-->>CLI: signed tx
+    CLI->>CLI: zeroize seed
+    CLI-->>Owner: From / Signature / Raw base58
+end
+```
+
+## Mode B — FROST Threshold Sign
+
+```mermaid
+sequenceDiagram
+
+participant Owner
+participant CLI
+participant Audit
+participant Share1
+participant Share2
+
+Owner->>CLI: horcrux mpc-sign mpc-1.hx mpc-2.hx --group-dir ...
+CLI->>Audit: assess attempt (share ids, time, history)
+Audit-->>CLI: allow / warn / block
+CLI->>Share1: decrypt key share
+CLI->>Share2: decrypt key share
+Share1-->>CLI: nonce commitment
+Share2-->>CLI: nonce commitment
+Share1-->>CLI: signature share
+Share2-->>CLI: signature share
+CLI->>CLI: aggregate -> Ed25519 signature
+CLI->>Audit: signed entry
+CLI-->>Owner: From / Signature / Raw base58
+```
+
+---
+
+# 18. Failure Scenarios
 
 The architecture is designed to fail securely.
 
 ## Scenario 1 – Lost USB
 
-Result
-
-No compromise.
-
-Threshold recovery remains possible.
-
----
+Result: No compromise. Threshold recovery remains possible.
 
 ## Scenario 2 – Incorrect Password
 
-Result
-
-AES authentication fails.
-
-No shard is revealed.
-
----
+Result: AES-GCM authentication fails. No shard is revealed. Logged as a
+`decrypt_fail`; repeated failures block future attempts.
 
 ## Scenario 3 – Corrupted USB
 
-Result
-
-Integrity verification fails.
-
+Result: Integrity verification fails (`horcrux verify` or the GCM tag check).
 Signing is aborted.
-
----
 
 ## Scenario 4 – Insufficient Guardians
 
-Result
-
-Threshold policy prevents reconstruction.
-
-No private key material is produced.
-
----
+Result: Threshold policy prevents reconstruction/signing (`NotEnoughShares`).
+No key material is produced.
 
 ## Scenario 5 – Suspicious Behavior
 
-Result
+Result: The audit scorer raises a block/warning before signing proceeds.
 
-The anomaly detection module raises an alert before the signing process proceeds.
+## Scenario 6 – Share Type Confusion
 
----
-
-## Scenario 6 – Coordinator Failure (Mode B)
-
-Result
-
-The signing session is aborted.
-
-Private key material remains protected because no complete key exists on any participant.
+Result: An SSS shard (`HX1`) is rejected as a FROST share (`HX2`) and vice
+versa via magic-byte checks; shares from different FROST groups are rejected.
 
 ---
 
-# 18. Future Extensibility
+# 19. Future Extensibility
 
-The architecture is intentionally modular to support future enhancements without redesigning the system.
+The architecture is intentionally modular to support future enhancements
+without redesigning the system.
 
 Potential extensions include:
 
 - Desktop GUI using Tauri
-- Mobile companion application
 - QR-based air-gapped MPC communication
-- Multi-chain support (Bitcoin, Solana, Cosmos)
-- Proactive secret sharing
+- Multi-chain support (Bitcoin, Cosmos)
+- Proactive secret sharing / periodic key refresh
+- Distributed Key Generation (DKG) to remove the trusted dealer
 - Hardware Security Module integration
-- FIDO2 / WebAuthn authentication
-- Secure enclave integration
-- Hardware-backed USB authentication
 - Third-party cryptographic audits
 
 ---
 
 # Design Principles
-
-HORCRUX is guided by the following engineering principles:
 
 - Never implement cryptographic primitives from scratch.
 - Prefer audited and well-established libraries.
@@ -1535,6 +1170,11 @@ HORCRUX is guided by the following engineering principles:
 
 # Conclusion
 
-HORCRUX combines threshold cryptography, authenticated encryption, secure memory management, and behavioral monitoring into a unified offline key management platform.
-
-Its architecture separates responsibilities across cryptographic, storage, authentication, networking, and monitoring layers while maintaining compatibility with Ethereum-compatible ecosystems. By supporting both air-gapped secret reconstruction (Mode A) and true threshold ECDSA signing (Mode B), HORCRUX provides flexibility for different operational and security requirements without compromising the principles of self-custody and defense in depth.
+HORCRUX combines threshold cryptography, authenticated encryption, secure
+memory management, and behavioral monitoring into a unified offline key
+management platform for Solana. Its architecture separates responsibilities
+across cryptographic, storage, authentication, networking, and monitoring
+layers. By supporting both air-gapped secret reconstruction (Mode A) and true
+threshold Ed25519 signing with FROST (Mode B), HORCRUX provides flexibility for
+different operational and security requirements without compromising the
+principles of self-custody and defense in depth.

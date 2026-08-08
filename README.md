@@ -493,7 +493,7 @@ Each module has a clearly defined responsibility to simplify auditing, testing, 
 | Elliptic Curve | Ed25519 (signing), secp256k1 (Shamir field) |
 | Chain Integration | solana-rpc-client (3.x split crates) |
 | MPC | FROST (frost-ed25519) |
-| AI | Isolation Forest |
+| AI | Rule-based scorer (z-scores + hard rules) |
 | Serialization | serde |
 | Storage | Binary Shard Files |
 | USB Medium | FAT32 / exFAT Drives |
@@ -506,32 +506,31 @@ Each module has a clearly defined responsibility to simplify auditing, testing, 
 horcrux/
 │
 ├── src/
-│   ├── cli/
-│   ├── crypto/
-│   ├── sss/
-│   ├── encryption/
-│   ├── authentication/
-│   ├── storage/
-│   ├── signing/
-│   ├── mpc/
-│   ├── blockchain/
-│   ├── ai/
-│   ├── logging/
-│   └── utils/
+│   ├── main.rs         CLI (clap)
+│   ├── lib.rs          split/encrypt/reconstruct pipeline
+│   ├── sss.rs          Shamir split & combine (vsss-rs)
+│   ├── crypto.rs       Argon2id + AES-256-GCM
+│   ├── shard.rs        HX1 shard file format
+│   ├── mpc.rs          Mode B FROST split & threshold sign
+│   ├── tx.rs           offline Solana transaction build/sign
+│   ├── chain.rs        RPC broadcast / blockhash / balance
+│   ├── audit.rs        access log + anomaly scorer
+│   ├── verify.rs       passive shard integrity checks
+│   └── error.rs        typed error enum
 │
 ├── tests/
+│   ├── roundtrip.rs
+│   ├── sign.rs
+│   ├── audit.rs
+│   ├── mpc.rs
+│   └── verify.rs
 │
-├── examples/
-│
-├── docs/
-│
-├── assets/
-│
-├── README.md
-├── ARCHITECTURE.md
-├── PLAN.md
+├── agent/wayfinder/PLAN.md
+├── Architecture.md
+├── demo.sh
 ├── Cargo.toml
-└── LICENSE
+├── LICENSE
+└── README.md
 ```
 ---
 
@@ -546,9 +545,9 @@ Before building HORCRUX, ensure the following tools are installed.
 | Rust | Stable (latest) |
 | Cargo | Latest |
 | Git | Latest |
-| OpenSSL | Latest |
 | USB Drive(s) | Recommended |
 | Linux / macOS / Windows | Supported |
+| solana-test-validator | Optional (live broadcast demo) |
 
 Verify your installation:
 
@@ -656,6 +655,7 @@ horcrux
 ├── sign
 ├── mpc-split
 ├── mpc-sign
+├── verify
 ├── log
 └── help
 ```
@@ -819,21 +819,24 @@ Valid Ed25519 Signature
 
 ## Verify
 
-Verify shard integrity.
+Passive integrity check for shard/share files. Never decrypts into the clear
+and never touches the access log.
 
 ```bash
-horcrux verify
+horcrux verify ./usb/shard-1.hx ./usb/shard-2.hx
+horcrux verify ./mpc/mpc-1.hx ./mpc/mpc-2.hx --password guardian
 ```
 
 Checks
 
-- Authentication tag
+- File magic (`HX1` SSS shard vs `HX2` FROST share) and format version
+- Exact file length / sealed-payload bounds
+- Metadata (threshold, share count, ids)
+- Cross-file consistency (all one kind, one split — mixed types or mixed
+  split parameters are reported)
+- With `--password`, each file's AES-256-GCM authentication tag
 
-- Corruption
-
-- Metadata
-
-- Version
+Exits non-zero if any file fails.
 
 ---
 
@@ -899,25 +902,28 @@ horcrux sign shard-1.hx shard-2.hx --password guardian ...
 
 # Configuration
 
-HORCRUX stores runtime configuration separately from encrypted shard data.
+HORCRUX is configured at the command line; there is no runtime config file.
+Key material never leaves shard files, and thresholds/shares are stored inside
+each shard's metadata rather than in a separate config.
 
-Example
+## Environment Variables
 
-```toml
-threshold = 2
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `HORCRUX_RPC_URL` | Solana JSON-RPC endpoint | `http://127.0.0.1:8899` |
+| `HORCRUX_ACCESS_LOG` | Access log path | `./horcrux-access.log` |
 
-shares = 3
+## CLI Flags
 
-curve = "secp256k1"
-
-mode = "offline"
-
-rpc = "http://127.0.0.1:8899"
-
-logging = true
-
-anomaly_detection = true
-```
+| Flag | Applies to | Purpose |
+|------|------------|---------|
+| `--threshold` / `--shares` | `init`, `mpc-split` | Threshold / total shares (default 2-of-3) |
+| `--password` | all split/sign commands | Shared guardian password (else prompt per shard) |
+| `--out-dir` | `init`, `mpc-split` | Where shard files are written |
+| `--group-dir` | `mpc-sign` | Directory containing `group.pub` |
+| `--to` / `--lamports` / `--blockhash` | `sign`, `mpc-sign` | Transaction parameters |
+| `--broadcast` / `--rpc-url` | `sign`, `mpc-sign` | Submit the signed tx to the cluster |
+| `--log-file` / `--force` | `sign`, `mpc-sign`, `reconstruct` | Audit log path / override a block |
 
 ---
 

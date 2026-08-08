@@ -6,6 +6,7 @@
 //! ([`solana_rpc_client::mock_sender`]) so no node is required.
 
 use crate::error::Error;
+use solana_commitment_config::CommitmentConfig;
 use solana_hash::Hash;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
@@ -29,9 +30,16 @@ pub struct Chain {
 
 impl Chain {
     /// Connect to a cluster over HTTP.
+    ///
+    /// Uses the `confirmed` commitment so that balances and blockhashes are
+    /// read after gossip confirmation rather than only after finalization
+    /// (which can lag on `solana-test-validator`).
     pub fn connect(rpc_url: &str) -> Self {
         Self {
-            client: RpcClient::new(rpc_url.to_string()),
+            client: RpcClient::new_with_commitment(
+                rpc_url.to_string(),
+                CommitmentConfig::confirmed(),
+            ),
         }
     }
 

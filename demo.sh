@@ -5,8 +5,10 @@
 # (SSS via vsss-rs, Argon2id, AES-256-GCM), the 83-byte shard file format,
 # reconstruction from any threshold subset, the failure modes
 # (wrong password / too few shards / mixed splits), the access-log /
-# anomaly-detection layer that blocks repeated failed attempts, and Mode B
-# FROST threshold signing where the key is never reconstructed on any machine.
+# anomaly-detection layer that blocks repeated failed attempts, Mode B
+# FROST threshold signing where the key is never reconstructed on any
+# machine, passive shard verification, and (when solana-test-validator is
+# installed) a live on-chain broadcast of both signing modes.
 #
 #   ./demo.sh          interactive step-through
 #   ./demo.sh --auto   run all steps without pausing
@@ -82,8 +84,15 @@ T=2
 N=3
 PW="guardian-demo-password"
 OUT="$(mktemp -d)"
+broadcast_ran=0
+# Any command without an explicit --log-file writes to the demo's temp dir
+# instead of polluting the repository root.
+export HORCRUX_ACCESS_LOG="$OUT/access.log"
 
 cleanup() {
+    if [[ -n "${VALIDATOR_PID:-}" ]]; then
+        kill "$VALIDATOR_PID" 2>/dev/null || true
+    fi
     if [[ "$KEEP" == 1 ]]; then
         printf '\n%sShard files kept for inspection: %s%s\n' "$DIM" "$OUT" "$RESET"
     else
@@ -100,8 +109,10 @@ printf '%s\n' "==================================="
 info "Walks through everything built so far: split + per-shard encryption"
 info "(vsss-rs Shamir, Argon2id, AES-256-GCM), the 83-byte shard format,"
 info "reconstruction from any 2 of 3 shards, the failure modes, the"
-info "access-log / anomaly-detection layer (Phase 3), and Mode B FROST"
-info "threshold signing where the key is never reconstructed (Phase 4)."
+info "access-log / anomaly-detection layer (Phase 3), Mode B FROST"
+info "threshold signing where the key is never reconstructed (Phase 4),"
+info "passive verify (Phase 5), and a live broadcast to the local"
+info "validator when solana-test-validator is installed."
 info "Each step runs the real CLI. Press Enter to advance."
 pause
 
@@ -285,10 +296,15 @@ else
 fi
 pause
 
+# Mode B signs against a fresh log so step 11's deliberate block
+# (3 failed decrypts) doesn't carry over into the MPC steps.
+export HORCRUX_ACCESS_LOG="$OUT/mode-b.log"
+
 # --- 12. optional test suite ------------------------------------------
 step 12 "full test suite (optional)"
-info "cargo test runs 48 unit tests (sss, crypto, shard, chain, audit, lib) plus"
-info "integration suites: tests/roundtrip.rs, tests/sign.rs, tests/audit.rs."
+info "cargo test runs 66 unit tests (sss, crypto, shard, chain, audit, tx, mpc,"
+info "verify, lib) plus integration suites: tests/roundtrip.rs, tests/sign.rs,"
+info "tests/audit.rs, tests/mpc.rs, tests/verify.rs."
 run_tests=0
 if [[ "$AUTO" == 1 ]]; then
     run_tests=1
@@ -397,6 +413,101 @@ else
 fi
 pause
 
+# --- 14. verify ---------------------------------------------------------
+step 14 "verify -- passive integrity checks (no key material touched)"
+info "verify reads the files without decrypting: magic (HX1 vs HX2), version,"
+info "length, and cross-file split consistency. With --password it additionally"
+info "checks the AES-GCM auth tag. It never writes to the access log."
+show "$BIN" verify "$OUT/shard-1.hx" "$OUT/shard-2.hx" --password "$PW"
+"$BIN" verify "$OUT/shard-1.hx" "$OUT/shard-2.hx" --password "$PW"
+show "$BIN" verify "$OUT/mpc/mpc-1.hx" "$OUT/mpc/mpc-2.hx" --password "$PW"
+"$BIN" verify "$OUT/mpc/mpc-1.hx" "$OUT/mpc/mpc-2.hx" --password "$PW"
+show "$BIN" verify "$OUT/shard-1.hx" "$OUT/shard-2.hx" --password wrong-password
+if "$BIN" verify "$OUT/shard-1.hx" "$OUT/shard-2.hx" --password wrong-password >/dev/null 2>&1; then
+    fail "verify must reject a wrong password"
+    exit 1
+fi
+ok "structure + auth-tag verification works for HX1 shards and HX2 shares"
+pause
+
+# --- 15. optional live broadcast ---------------------------------------
+step 15 "live broadcast to solana-test-validator (optional)"
+if ! command -v solana-test-validator >/dev/null 2>&1; then
+    warn "solana-test-validator not found -- skipping live broadcast step"
+    warn "install it, then re-run ./demo.sh to see transactions confirmed on-chain"
+else
+    info "Starting a fresh local validator; will fund the derived address, then"
+    info "broadcast a Mode A and a Mode B signed transfer and wait for confirmation."
+    LEDGER="$OUT/ledger"
+    if [[ -d "$LEDGER" ]]; then
+        rm -rf "$LEDGER"
+    fi
+    solana-test-validator --ledger "$LEDGER" --quiet >"$OUT/validator.log" 2>&1 &
+    VALIDATOR_PID=$!
+
+    info "waiting for the validator RPC on http://127.0.0.1:8899 ..."
+    ready=0
+    for _ in $(seq 1 90); do
+        if solana cluster-version --url http://127.0.0.1:8899 >/dev/null 2>&1; then
+            ready=1
+            break
+        fi
+        sleep 1
+    done
+    if [[ "$ready" != 1 ]]; then
+        fail "validator did not become ready -- see $OUT/validator.log"
+        exit 1
+    fi
+    ok "validator ready (localnet, RPC 127.0.0.1:8899)"
+    broadcast_ran=1
+
+    show solana airdrop 1 "$A_FROM" --url http://127.0.0.1:8899
+    if ! solana airdrop 1 "$A_FROM" --url http://127.0.0.1:8899 >/dev/null; then
+        fail "airdrop failed -- cannot fund the derived address"
+        exit 1
+    fi
+    ok "funded sender $A_FROM with 1 SOL"
+
+    show solana airdrop 1 "$TO" --url http://127.0.0.1:8899
+    if ! solana airdrop 1 "$TO" --url http://127.0.0.1:8899 >/dev/null; then
+        fail "airdrop failed -- cannot fund the recipient address"
+        exit 1
+    fi
+    ok "funded recipient $TO so the recipient is rent-exempt"
+
+    show "$BIN" sign "$OUT/shard-1.hx" "$OUT/shard-2.hx" --password "$PW" \
+        --log-file "$OUT/broadcast.log" --to "$TO" --lamports 1 --broadcast
+    A_BROADCAST="$("$BIN" sign "$OUT/shard-1.hx" "$OUT/shard-2.hx" --password "$PW" \
+        --log-file "$OUT/broadcast.log" --to "$TO" --lamports 1 --broadcast)"
+    printf '%s\n' "$A_BROADCAST"
+    if ! printf '%s\n' "$A_BROADCAST" | grep -q "Mined:.*confirmed"; then
+        fail "Mode A broadcast did not confirm"
+        exit 1
+    fi
+    ok "Mode A transfer confirmed on-chain"
+
+    show "$BIN" mpc-sign "$OUT/mpc/mpc-1.hx" "$OUT/mpc/mpc-2.hx" --group-dir "$OUT/mpc" \
+        --password "$PW" --log-file "$OUT/broadcast.log" --to "$TO" --lamports 1 --broadcast
+    B_BROADCAST="$("$BIN" mpc-sign "$OUT/mpc/mpc-1.hx" "$OUT/mpc/mpc-2.hx" --group-dir "$OUT/mpc" \
+        --password "$PW" --log-file "$OUT/broadcast.log" --to "$TO" --lamports 1 --broadcast)"
+    printf '%s\n' "$B_BROADCAST"
+    if ! printf '%s\n' "$B_BROADCAST" | grep -q "Mined:.*confirmed"; then
+        fail "Mode B broadcast did not confirm"
+        exit 1
+    fi
+    ok "Mode B (FROST) transfer confirmed on-chain"
+
+    info "The audit log records both confirmed broadcasts:"
+    show "$BIN" log --log-file "$OUT/broadcast.log" --tail 2
+    "$BIN" log --log-file "$OUT/broadcast.log" --tail 2
+
+    kill "$VALIDATOR_PID" 2>/dev/null || true
+    wait "$VALIDATOR_PID" 2>/dev/null || true
+    VALIDATOR_PID=""
+    ok "validator stopped"
+fi
+pause
+
 # --- wrap-up ------------------------------------------------------------
 printf '\n%s==============================================%s\n' "$BOLD" "$RESET"
 printf '%s  DEMO COMPLETE  --  everything verified %s\n' "$BOLD" "$RESET"
@@ -412,10 +523,17 @@ ok "audit:       every shard decrypt logged; 3 failures block signing"
 ok "mpc:         2-of-3 FROST key shares sign without reconstructing the key"
 ok "mpc:         same sender address as Mode A; signatures non-deterministic"
 ok "mpc:         rejected: too few participants / Mode A shard as FROST share"
+ok "verify:      structural + auth-tag integrity checks (HX1 and HX2)"
+if [[ "$broadcast_ran" == 1 ]]; then
+    ok "broadcast:   Mode A and Mode B transfers confirmed on solana-test-validator"
+else
+    warn "broadcast:   skipped (solana-test-validator not installed)"
+fi
 if [[ "$run_tests" == 1 ]]; then
-    ok "tests:      58 unit + 8 roundtrip + 3 sign + 4 audit + 7 mpc tests green"
+    ok "tests:      66 unit + 8 roundtrip + 3 sign + 4 audit + 7 mpc + 3 verify tests green"
 fi
 printf '%s\n' "---"
 info "Phases 1-4 are done end to end: init, reconstruct, offline sign + broadcast"
-info "to the local validator, audit/anomaly detection, and Mode B FROST threshold"
-info "signing where the key never exists on any machine."
+info "to the local validator, audit/anomaly detection, Mode B FROST threshold"
+info "signing where the key never exists on any machine, and passive verify."
+info "Phase 5 hardens the CLI surface (verify) and rehearses the full demo."

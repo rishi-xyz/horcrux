@@ -202,6 +202,25 @@ record a demo script/video as a viva fallback if live demo has issues.
 **Visible outcome:** `cargo test` passes end-to-end; a rehearsed demo script that runs
 clean twice in a row.
 
+> **Status — done.** Added the `horcrux verify` subcommand (HX1 shards / HX2 shares):
+> passive structural checks — magic, format version, exact length, metadata, cross-file
+> split consistency, and (with `--password`) each file's AES-GCM auth tag — exiting
+> non-zero on any failure and never touching the access log. Removed the one unused
+> dependency (`tempfile`) and dropped the LICENSE until a license is chosen. Rewrote
+> `Architecture.md` to match the shipped system (Ed25519/FROST, no EVM, no Isolation
+> Forest) and fixed README drift: real repo structure, prerequisites, updated CLI tree,
+> corrected test counts, and a rewritten Configuration section (env vars + CLI flags
+> instead of a TOML file that never existed). `demo.sh` gained two steps — passive
+> `verify` (step 14) and a live broadcast to `solana-test-validator` (step 15) that
+> funds the derived sender, broadcasts Mode A and Mode B transfers, and confirms both
+> on-chain. Two real bugs surfaced by the new broadcast step and fixed: the RPC client
+> read balances at `finalized` commitment (invisible 0-balance on a fresh localnet —
+> now `confirmed`), and transfers to a non-existent recipient failed rent simulation
+> (demo now funds the recipient too). Gates green: `cargo fmt`, `cargo clippy
+> --all-targets --offline -- -D warnings`, `cargo test` (66 unit + 25 integration =
+> 91 tests), and `./demo.sh --auto` runs clean twice in a row, including the live
+> on-chain broadcast.
+
 ---
 
 ## Phase 6 — Buffer + Report Alignment (Week 8)

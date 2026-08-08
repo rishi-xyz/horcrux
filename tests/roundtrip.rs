@@ -111,16 +111,20 @@ fn too_few_shards_fails() {
 
 #[test]
 fn mixed_shards_from_different_splits_fail() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir_a = tempfile::tempdir().expect("tempdir a");
+    let dir_b = tempfile::tempdir().expect("tempdir b");
     let key = key();
     let pws = passwords(3, "guardian");
 
-    let set_a = init_shards(&key, 2, 3, dir.path(), &pws).expect("init a");
-    let set_b = init_shards(&key, 3, 3, dir.path(), &pws).expect("init b");
+    let set_a = init_shards(&key, 2, 3, dir_a.path(), &pws).expect("init a");
+    let set_b = init_shards(&key, 3, 3, dir_b.path(), &pws).expect("init b");
 
     let mixed = vec![set_a[0].clone(), set_b[0].clone()];
     let pws = vec![pws[0].clone(), pws[1].clone()];
-    assert!(reconstruct(&mixed, &pws).is_err());
+    assert!(matches!(
+        reconstruct(&mixed, &pws),
+        Err(Error::SplitMismatch { .. })
+    ));
 }
 
 #[test]
