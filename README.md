@@ -2,6 +2,8 @@
 
 > **Offline Threshold Key Management System for Blockchain Private Keys**
 
+[![CI](https://github.com/rishi-xyz/horcrux/actions/workflows/ci.yml/badge.svg)](https://github.com/rishi-xyz/horcrux/actions/workflows/ci.yml)
+
 HORCRUX is a Rust-based offline threshold key management system that eliminates the single point of failure associated with traditional cryptocurrency wallets. Instead of storing an entire private key on one device, HORCRUX distributes cryptographic control across multiple trusted guardians using **Shamir's Secret Sharing (SSS)** and supports **FROST threshold Multi-Party Computation (MPC)** for secure transaction signing.
 
 Designed for self-custody, security-critical environments, and blockchain infrastructure, HORCRUX enables users to securely split, store, recover, and sign blockchain transactions without relying on cloud providers or centralized custody services.
@@ -527,10 +529,16 @@ horcrux/
 │
 ├── agent/wayfinder/PLAN.md
 ├── Architecture.md
+├── CONTRIBUTING.md   contribution + release workflow
 ├── demo.sh
 ├── Cargo.toml
 ├── LICENSE
-└── README.md
+├── README.md
+└── .github/
+    ├── workflows/
+    │   ├── ci.yml        PR/push verification on main
+    │   └── release.yml   tag-triggered binary release
+    └── dependabot.yml    dependency update PRs
 ```
 ---
 
@@ -1351,7 +1359,8 @@ Rust reduces classes of vulnerabilities common in systems programming.
 
 # Contributing
 
-Contributions are welcome.
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full
+contribution and release workflow.
 
 Recommended workflow
 
@@ -1368,7 +1377,19 @@ Write Tests
 
 ↓
 
+Run Checks Locally
+
+↓
+
 Submit Pull Request
+
+↓
+
+CI Verifies
+
+↓
+
+Merge into main
 ```
 
 Please ensure
@@ -1380,6 +1401,16 @@ Please ensure
 - Documentation updated
 
 - Security considerations explained
+
+### Continuous integration
+
+`main` is protected like a production branch. Every pull request targeting
+`main` and every push to `main` runs the [`CI`](.github/workflows/ci.yml)
+workflow (`fmt`, `clippy`, `test`, `build-release`, `security-audit`,
+`gitleaks`). The aggregate `CI / verify` check is required before any merge, so
+code can only reach `main` after it has been verified. Version tags (`v1.0.0`)
+trigger the [`Release`](.github/workflows/release.yml) workflow, which builds
+and publishes the binary to a GitHub release.
 
 ---
 

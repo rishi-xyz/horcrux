@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests (locked to committed lockfile)
+        run: cargo test --all-targets --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Compute checksum
+        run: sha256sum target/release/horcrux > target/release/horcrux.sha256
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2.6.2
+        with:
+          files: |
+            target/release/horcrux
+            target/release/horcrux.sha256
+          generate_release_notes: true
