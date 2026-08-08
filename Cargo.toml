@@ -30,7 +30,7 @@ solana-system-interface = { version = "3", features = ["bincode"] }
 solana-transaction = { version = "3", features = ["bincode"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-vsss-rs = "5.4.0"
+vsss-rs = "6.0.1"
 zeroize = "1.8"
 
 [dev-dependencies]
