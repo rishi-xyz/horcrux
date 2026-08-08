@@ -56,6 +56,14 @@ pub enum Error {
     #[error("transaction error: {0}")]
     Tx(String),
 
+    /// Failed to build or sign a Bitcoin (Taproot) transaction.
+    #[error("bitcoin error: {0}")]
+    Bitcoin(String),
+
+    /// Failed to build or sign a Cosmos SDK transaction.
+    #[error("cosmos error: {0}")]
+    Cosmos(String),
+
     /// The audit layer refused the attempt before any key material was used.
     #[error("access audit blocked the attempt: {0}")]
     Blocked(String),
