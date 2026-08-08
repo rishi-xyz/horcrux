@@ -6,7 +6,7 @@ description = "Offline Threshold Key Management System for Blockchain Private Ke
 license = "MIT"
 
 [dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 anyhow = "1"
 argon2 = "0.5"
 bincode = "1"
