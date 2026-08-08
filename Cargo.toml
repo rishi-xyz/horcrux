@@ -6,31 +6,31 @@ description = "Offline Threshold Key Management System for Blockchain Private Ke
 license = "MIT"
 
 [dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 anyhow = "1"
 argon2 = "0.5"
-bincode = "1"
+bincode = "3"
 bs58 = "0.5"
 clap = { version = "4.6", features = ["derive"] }
-ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] }
+ed25519-dalek = { version = "3.0", features = ["rand_core", "zeroize"] }
 frost-ed25519 = "3.0.0"
 hex = "0.4"
-k256 = "0.13"
-rand = "0.8"
+k256 = "0.14"
+rand = "0.10"
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 solana-commitment-config = "3"
-solana-hash = "3"
+solana-hash = "4"
 solana-message = { version = "3", features = ["bincode"] }
-solana-pubkey = "3"
+solana-pubkey = "4"
 solana-rpc-client = "=3.0.7"
 solana-signature = { version = "3", features = ["verify"] }
 solana-system-interface = { version = "3", features = ["bincode"] }
 solana-transaction = { version = "3", features = ["bincode"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-vsss-rs = "5.4.0"
+vsss-rs = "6.0.1"
 zeroize = "1.8"
 
 [dev-dependencies]
