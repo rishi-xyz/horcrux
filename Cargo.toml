@@ -23,7 +23,7 @@ serde_json = "1"
 solana-commitment-config = "3"
 solana-hash = "3"
 solana-message = { version = "3", features = ["bincode"] }
-solana-pubkey = "3"
+solana-pubkey = "4"
 solana-rpc-client = "=3.0.7"
 solana-signature = { version = "3", features = ["verify"] }
 solana-system-interface = { version = "3", features = ["bincode"] }
