@@ -10,16 +10,19 @@ aes-gcm = "0.10"
 anyhow = "1"
 argon2 = "0.5"
 bincode = "1"
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 bs58 = "0.5"
 clap = { version = "4.6", features = ["derive"] }
+cosmrs = { version = "0.22", default-features = false }
 ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] }
 frost-ed25519 = "3.0.0"
 hex = "0.4"
-k256 = "0.13"
+k256 = { version = "0.13", features = ["schnorr"] }
 rand = "0.8"
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 solana-commitment-config = "3"
 solana-hash = "3"
 solana-message = { version = "3", features = ["bincode"] }

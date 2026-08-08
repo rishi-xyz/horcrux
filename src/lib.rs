@@ -1,12 +1,15 @@
 //! horcrux — split an Ed25519 signing seed via Shamir's Secret Sharing (over the
 //! secp256k1 field), encrypt the shares with per-shard guardian passwords
 //! (Argon2id + AES-256-GCM), reconstruct the seed from any threshold subset of
-//! shard files, and sign Solana transactions. Mode B adds FROST threshold
-//! signatures (`src/mpc.rs`): the same seed is dealer-split into key shares so
-//! signing never reconstructs the key on any machine.
+//! shard files, and sign Solana, Bitcoin (Taproot), and Cosmos SDK
+//! transactions. Mode B adds FROST threshold signatures (`src/mpc.rs`): the
+//! same seed is dealer-split into key shares so signing never reconstructs the
+//! key on any machine.
 
 pub mod audit;
+pub mod bitcoin;
 pub mod chain;
+pub mod cosmos;
 pub mod crypto;
 pub mod error;
 pub mod mpc;
@@ -255,6 +258,28 @@ pub fn sign_transaction_from_mpc_shares(
     )?;
     let signed = tx::sign_transaction_with_signature(params, signature, verifying_key)?;
     Ok(signed.into())
+}
+
+/// Reconstruct the key from shards and sign a Bitcoin Taproot transfer entirely
+/// offline (Mode A).
+pub fn sign_bitcoin_transaction_from_shards(
+    shard_paths: &[PathBuf],
+    passwords: &[String],
+    params: bitcoin::BitcoinParams,
+) -> Result<bitcoin::SignedBitcoinTx, Error> {
+    let key = reconstruct(shard_paths, passwords)?;
+    bitcoin::sign_transaction(*key_seed(&key), params)
+}
+
+/// Reconstruct the key from shards and sign a Cosmos `bank.MsgSend` entirely
+/// offline (Mode A).
+pub fn sign_cosmos_transaction_from_shards(
+    shard_paths: &[PathBuf],
+    passwords: &[String],
+    params: cosmos::CosmosParams,
+) -> Result<cosmos::SignedCosmosTx, Error> {
+    let key = reconstruct(shard_paths, passwords)?;
+    cosmos::sign_transaction(*key_seed(&key), params)
 }
 
 /// Extract the share identifier (x-coordinate) as a `u8`.
