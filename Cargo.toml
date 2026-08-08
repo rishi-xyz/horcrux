@@ -9,7 +9,7 @@ license = "MIT"
 aes-gcm = "0.10"
 anyhow = "1"
 argon2 = "0.5"
-bincode = "1"
+bincode = "3"
 bs58 = "0.5"
 clap = { version = "4.6", features = ["derive"] }
 ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] }
