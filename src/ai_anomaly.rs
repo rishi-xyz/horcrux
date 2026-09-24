@@ -187,7 +187,10 @@ mod tests {
 
     #[test]
     fn formats_entries_readably() {
-        let entries = vec![Entry::ok(1_767_225_600_000, 9, 2), Entry::fail(1_767_225_600_000, 9, 3)];
+        let entries = vec![
+            Entry::ok(1_767_225_600_000, 9, 2),
+            Entry::fail(1_767_225_600_000, 9, 3),
+        ];
         let out = format_entries(&entries);
         assert!(out.contains("decrypt_ok"));
         assert!(out.contains("decrypt_fail"));

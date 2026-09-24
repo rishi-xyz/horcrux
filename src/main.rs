@@ -1048,7 +1048,9 @@ async fn main() -> anyhow::Result<()> {
             println!(
                 "Sending {} log entries to {}...",
                 entries.len(),
-                model.as_deref().unwrap_or(horcrux::ai_anomaly::DEFAULT_MODEL)
+                model
+                    .as_deref()
+                    .unwrap_or(horcrux::ai_anomaly::DEFAULT_MODEL)
             );
 
             match horcrux::ai_anomaly::check(&entries, &api_key, model.as_deref()).await {
@@ -1523,7 +1525,9 @@ fn warn_if_not_ignored(path: &Path) {
 /// joins it (via [`join_ai_check`]) once that work is done so the warning,
 /// if any, has a chance to print before the process exits. Silently does
 /// nothing when no key is configured, so this is purely additive.
-fn spawn_ai_background_check(history: Vec<horcrux::audit::Entry>) -> Option<tokio::task::JoinHandle<()>> {
+fn spawn_ai_background_check(
+    history: Vec<horcrux::audit::Entry>,
+) -> Option<tokio::task::JoinHandle<()>> {
     let api_key = std::env::var("OPENROUTER_API_KEY").ok()?;
     let model = std::env::var("HORCRUX_AI_MODEL").ok();
     Some(tokio::spawn(async move {
