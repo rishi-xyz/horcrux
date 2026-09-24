@@ -488,6 +488,7 @@ Each module has a clearly defined responsibility to simplify auditing, testing, 
 |----------|------------|
 | Language | Rust |
 | CLI | clap |
+| TUI | ratatui + crossterm + tui-input |
 | Secret Sharing | vsss-rs |
 | Encryption | AES-256-GCM |
 | Password KDF | Argon2id |
@@ -678,6 +679,7 @@ horcrux
 ├── qr-finalize
 ├── verify
 ├── log
+├── tui           (interactive terminal UI)
 └── help
 ```
 
@@ -994,6 +996,45 @@ Shows
 - shard id
 
 - outcome: `ok` / `fail` / `blocked` / `signed`
+
+---
+
+## Interactive TUI
+
+A terminal UI covering the Solana-only MVP flows (Mode A and Mode B), for
+guardians who would rather navigate menus and forms than memorize flags.
+
+```bash
+horcrux tui
+```
+
+```
+horcrux
+└── tui
+    ├── Access log        (read-only; color-coded by verdict/entry kind)
+    ├── Verify             shard/share files
+    ├── Init                — split a key (Mode A)
+    ├── Sign                — Mode A, offline or broadcast
+    └── MPC split/sign      — Mode B, offline or broadcast
+```
+
+Navigation is Tab/Shift+Tab between fields, arrow keys within lists, Space to
+toggle a checkbox, Enter to run, Esc to go back. Password fields are always
+masked as they're typed. Bitcoin/Cosmos chain selection and the air-gapped QR
+flow (`qr-*`) are CLI-only for now; the TUI is Solana Mode A/B, matching the
+"ship the MVP first" sequencing the rest of this project follows.
+
+Like `sign`/`mpc-sign`, the Sign and MPC screens run the same audit pre-flight
+as the CLI before any key material is touched: a `Warn` verdict shows a modal
+you must explicitly continue past, and a `Block` verdict shows a modal you
+must explicitly force through (both choices are logged, exactly like
+`--force` on the CLI).
+
+No screen ever displays a reconstructed private key or seed — Sign and MPC
+Sign go straight from decrypted key to signed output without the key ever
+becoming on-screen state. The one exception, matching the CLI's own
+behavior, is a freshly **generated** disposable test key on the Init/MPC
+Split screens, shown once with an explicit "shown once" label.
 
 ---
 
@@ -1480,6 +1521,7 @@ Rust reduces classes of vulnerabilities common in systems programming.
 - Mode B FROST Signing (Solana, Bitcoin)
 - QR-Based Air-Gapped Mode B (Solana)
 - Multi-Chain Signing (Solana, Bitcoin, Cosmos)
+- Interactive TUI (Solana Mode A/B MVP)
 - Logging
 - AI Detection
 
