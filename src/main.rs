@@ -7,7 +7,7 @@ use horcrux::tx::{TxParams, derive_address};
 use horcrux::{init_shards, reconstruct_with_audit};
 use k256::SecretKey;
 use rand::rngs::OsRng;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The chain a transaction is built for.
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -280,6 +280,40 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Save an OpenRouter API key (and optionally a default model) to a
+    /// local .env file, so `ai-check` and the automatic background anomaly
+    /// check before every sign/reconstruct can use it without exporting an
+    /// environment variable every session.
+    AiSetup {
+        /// OpenRouter API key (from https://openrouter.ai/keys). Prompted
+        /// for if omitted.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Default model to save alongside the key.
+        #[arg(long)]
+        model: Option<String>,
+        /// .env file to write to.
+        #[arg(long, default_value = ".env")]
+        env_file: PathBuf,
+    },
+    /// Ask a free OpenRouter model to look over the access log for anything
+    /// unusual (bursts of failures, odd hours, repeated blocks, ...).
+    /// Advisory only: it only prints a warning and never blocks signing.
+    /// Requires the OPENROUTER_API_KEY environment variable (set directly,
+    /// via `.env`, or via `horcrux ai-setup`).
+    AiCheck {
+        /// Access log file (default: ./horcrux-access.log or
+        /// $HORCRUX_ACCESS_LOG).
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+        /// Only send the last N log entries to the model.
+        #[arg(long, default_value_t = 50)]
+        tail: usize,
+        /// OpenRouter model id (default: a free model, overridable also via
+        /// $HORCRUX_AI_MODEL).
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Show the access log.
     Log {
         /// Access log file (default: ./horcrux-access.log or
@@ -427,6 +461,11 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Pick up OPENROUTER_API_KEY / HORCRUX_AI_MODEL (and anything else) from
+    // a .env file in the current directory or an ancestor, if present. A
+    // real environment variable always wins.
+    dotenvy::dotenv().ok();
+
     let cli = Cli::parse();
     match cli.command {
         Command::Init {
@@ -544,10 +583,11 @@ async fn main() -> anyhow::Result<()> {
                 false,
             )?;
 
-            let (access_log, attempt) =
+            let (access_log, attempt, ai_check) =
                 audit_preflight(horcrux::audit::shard_ids(&shards)?, log_file, force)?;
             let key = reconstruct_with_audit(&shards, &passwords, &access_log, attempt)?;
             println!("Reconstructed key: 0x{}", hex::encode(key.to_bytes()));
+            join_ai_check(ai_check).await;
         }
         Command::Sign {
             shards,
@@ -624,7 +664,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     };
 
-                    let (access_log, attempt) =
+                    let (access_log, attempt, ai_check) =
                         audit_preflight(horcrux::audit::shard_ids(&shards)?, log_file, force)?;
                     let key = reconstruct_with_audit(&shards, &passwords, &access_log, attempt)?;
                     let seed = horcrux::key_seed(&key);
@@ -663,6 +703,7 @@ async fn main() -> anyhow::Result<()> {
                         .await?;
                         println!("Mined:     {signature} (confirmed)");
                     }
+                    join_ai_check(ai_check).await;
                 }
                 ChainKind::Bitcoin => {
                     let recipient = horcrux::bitcoin::parse_address(&to)?;
@@ -681,7 +722,7 @@ async fn main() -> anyhow::Result<()> {
                         .map(horcrux::bitcoin::parse_address)
                         .transpose()?;
 
-                    let (access_log, attempt) =
+                    let (access_log, attempt, ai_check) =
                         audit_preflight(horcrux::audit::shard_ids(&shards)?, log_file, force)?;
                     let key = reconstruct_with_audit(&shards, &passwords, &access_log, attempt)?;
                     let seed = horcrux::key_seed(&key);
@@ -713,6 +754,7 @@ async fn main() -> anyhow::Result<()> {
                         )?;
                         println!("Mined:     {txid} (accepted by mempool)");
                     }
+                    join_ai_check(ai_check).await;
                 }
                 ChainKind::Cosmos => {
                     if rpc_user.is_some() || rpc_password.is_some() {
@@ -741,7 +783,7 @@ async fn main() -> anyhow::Result<()> {
                     let fee = fee
                         .ok_or_else(|| anyhow::anyhow!("--fee is required for the cosmos chain"))?;
 
-                    let (access_log, attempt) =
+                    let (access_log, attempt, ai_check) =
                         audit_preflight(horcrux::audit::shard_ids(&shards)?, log_file, force)?;
                     let key = reconstruct_with_audit(&shards, &passwords, &access_log, attempt)?;
                     let seed = horcrux::key_seed(&key);
@@ -768,6 +810,7 @@ async fn main() -> anyhow::Result<()> {
                         let tx_hash = horcrux::cosmos::broadcast(&rpc_url, &signed).await?;
                         println!("Mined:     {tx_hash} (committed)");
                     }
+                    join_ai_check(ai_check).await;
                 }
             }
         }
@@ -830,7 +873,7 @@ async fn main() -> anyhow::Result<()> {
                 let group_pub = group_dir.join(horcrux::btc_mpc::BTC_GROUP_PUB_FILENAME);
                 let output_xonly = horcrux::btc_mpc::group_output_xonly(&group_pub)?;
 
-                let (access_log, attempt) =
+                let (access_log, attempt, ai_check) =
                     audit_preflight(horcrux::btc_mpc::shard_ids(&shares)?, log_file, force)?;
 
                 let recipient_str = recipient.to_string();
@@ -874,6 +917,7 @@ async fn main() -> anyhow::Result<()> {
                     )?;
                     println!("Mined:     {txid} (accepted by mempool)");
                 }
+                join_ai_check(ai_check).await;
                 return Ok(());
             }
 
@@ -912,7 +956,7 @@ async fn main() -> anyhow::Result<()> {
             let verifying_key: [u8; 32] = horcrux::mpc::group_verifying_key(&group_pub)?;
             let from = solana_pubkey::Pubkey::from(verifying_key);
 
-            let (access_log, attempt) =
+            let (access_log, attempt, ai_check) =
                 audit_preflight(horcrux::mpc::shard_ids(&shares)?, log_file, force)?;
 
             if let Some(chain) = &chain {
@@ -960,6 +1004,63 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
                 println!("Mined:     {signature} (confirmed)");
+            }
+            join_ai_check(ai_check).await;
+        }
+        Command::AiSetup {
+            api_key,
+            model,
+            env_file,
+        } => {
+            let api_key = match api_key {
+                Some(k) => k,
+                None => rpassword::prompt_password(
+                    "OpenRouter API key (from https://openrouter.ai/keys): ",
+                )?,
+            };
+            if api_key.trim().is_empty() {
+                anyhow::bail!("API key cannot be empty");
+            }
+            write_env_var(&env_file, "OPENROUTER_API_KEY", api_key.trim())?;
+            if let Some(model) = &model {
+                write_env_var(&env_file, "HORCRUX_AI_MODEL", model)?;
+            }
+            println!("Saved to {}", env_file.display());
+            println!(
+                "`horcrux ai-check` and the automatic pre-sign anomaly check will pick this up automatically."
+            );
+            warn_if_not_ignored(&env_file);
+        }
+        Command::AiCheck {
+            log_file,
+            tail,
+            model,
+        } => {
+            let api_key = std::env::var("OPENROUTER_API_KEY").map_err(|_| {
+                anyhow::anyhow!(
+                    "set OPENROUTER_API_KEY to use ai-check (get a free key at https://openrouter.ai/keys)"
+                )
+            })?;
+            let model = model.or_else(|| std::env::var("HORCRUX_AI_MODEL").ok());
+
+            let log = horcrux::audit::AccessLog::open(access_log_path(log_file));
+            let entries = log.tail(tail)?;
+            println!(
+                "Sending {} log entries to {}...",
+                entries.len(),
+                model.as_deref().unwrap_or(horcrux::ai_anomaly::DEFAULT_MODEL)
+            );
+
+            match horcrux::ai_anomaly::check(&entries, &api_key, model.as_deref()).await {
+                Ok(v) if v.anomaly => {
+                    println!("AI ANOMALY WARNING [{}]: {}", v.model, v.summary);
+                }
+                Ok(v) => {
+                    println!("AI check [{}]: nothing unusual — {}", v.model, v.summary);
+                }
+                Err(e) => {
+                    println!("AI check unavailable (non-fatal): {e}");
+                }
             }
         }
         Command::Log {
@@ -1063,7 +1164,7 @@ async fn main() -> anyhow::Result<()> {
             let request = horcrux::qr_mpc::RequestData::from_payload(session, &payload)?;
 
             let share_id = horcrux::mpc::FrostShare::read(&share)?.id;
-            let (access_log, attempt) = audit_preflight(vec![share_id], log_file, force)?;
+            let (access_log, attempt, ai_check) = audit_preflight(vec![share_id], log_file, force)?;
             let ts = horcrux::audit::now_ms();
             let participant =
                 horcrux::qr_mpc::load_participant(&request, &share, &password, |id, ok| {
@@ -1099,6 +1200,7 @@ async fn main() -> anyhow::Result<()> {
                 "Nonces kept locally at {} until `qr-share` runs; do not copy this file across the air gap.",
                 nonce_path.display()
             );
+            join_ai_check(ai_check).await;
         }
         Command::QrPackage { dir, format } => {
             let (msg_type, session, payload) =
@@ -1170,7 +1272,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let share_id = horcrux::mpc::FrostShare::read(&share)?.id;
-            let (access_log, attempt) = audit_preflight(vec![share_id], log_file, force)?;
+            let (access_log, attempt, ai_check) = audit_preflight(vec![share_id], log_file, force)?;
             let ts = horcrux::audit::now_ms();
             let participant =
                 horcrux::qr_mpc::load_participant(&request, &share, &password, |id, ok| {
@@ -1216,6 +1318,7 @@ async fn main() -> anyhow::Result<()> {
             for p in &paths {
                 println!("  {}", p.display());
             }
+            join_ai_check(ai_check).await;
         }
         Command::QrFinalize {
             dir,
@@ -1337,13 +1440,22 @@ fn audit_preflight(
     ids: Vec<u8>,
     log_file: Option<PathBuf>,
     force: bool,
-) -> anyhow::Result<(horcrux::audit::AccessLog, u64)> {
+) -> anyhow::Result<(
+    horcrux::audit::AccessLog,
+    u64,
+    Option<tokio::task::JoinHandle<()>>,
+)> {
     use horcrux::audit::{Entry, Scorer, Verdict};
 
     let log = horcrux::audit::AccessLog::open(access_log_path(log_file));
     let history = log.read_all()?;
     let now = horcrux::audit::now_ms();
     let attempt: u64 = rand::random();
+
+    // Fire the AI anomaly check now, in the background, so it runs
+    // concurrently with the actual decrypt/sign work below instead of
+    // adding latency up front.
+    let ai_check = spawn_ai_background_check(history.clone());
 
     match Scorer::new().assess(&history, &ids, now) {
         Verdict::Block(reasons) => {
@@ -1357,13 +1469,83 @@ fn audit_preflight(
         Verdict::Warn(reasons) => println!("Audit: WARN — {}", reasons.join("; ")),
         Verdict::Allow => {}
     }
-    Ok((log, attempt))
+    Ok((log, attempt, ai_check))
 }
 
 /// Resolve the access log path: `--log-file`, else `$HORCRUX_ACCESS_LOG`,
 /// else the default `./horcrux-access.log`.
 fn access_log_path(flag: Option<PathBuf>) -> PathBuf {
     horcrux::audit::resolve_log_path(flag)
+}
+
+/// Write (or update in place) a `KEY=value` line in a .env-style file,
+/// creating the file if it does not exist yet.
+fn write_env_var(path: &Path, key: &str, value: &str) -> anyhow::Result<()> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
+    let prefix = format!("{key}=");
+    match lines.iter_mut().find(|line| line.starts_with(&prefix)) {
+        Some(line) => *line = format!("{key}={value}"),
+        None => lines.push(format!("{key}={value}")),
+    }
+    std::fs::write(path, lines.join("\n") + "\n")?;
+    Ok(())
+}
+
+/// Best-effort nudge: if `path`'s file name doesn't appear in a .gitignore
+/// next to it, remind the user it now holds a secret API key.
+fn warn_if_not_ignored(path: &Path) {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let gitignore = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(".gitignore");
+    let ignored = std::fs::read_to_string(&gitignore)
+        .map(|contents| {
+            contents
+                .lines()
+                .any(|l| l.trim() == name || l.trim() == "*.env")
+        })
+        .unwrap_or(false);
+    if !ignored {
+        println!(
+            "Note: {name} holds a secret API key — add it to .gitignore so it never gets committed."
+        );
+    }
+}
+
+/// Spawn a background AI anomaly check against the access log, if an
+/// OpenRouter API key is configured (env, `.env`, or `horcrux ai-setup`).
+/// Runs concurrently with the reconstruct/sign work that follows; the caller
+/// joins it (via [`join_ai_check`]) once that work is done so the warning,
+/// if any, has a chance to print before the process exits. Silently does
+/// nothing when no key is configured, so this is purely additive.
+fn spawn_ai_background_check(history: Vec<horcrux::audit::Entry>) -> Option<tokio::task::JoinHandle<()>> {
+    let api_key = std::env::var("OPENROUTER_API_KEY").ok()?;
+    let model = std::env::var("HORCRUX_AI_MODEL").ok();
+    Some(tokio::spawn(async move {
+        let tail_len = history.len().min(50);
+        let tail = &history[history.len() - tail_len..];
+        match horcrux::ai_anomaly::check(tail, &api_key, model.as_deref()).await {
+            Ok(v) if v.anomaly => {
+                eprintln!("AI ANOMALY WARNING [{}]: {}", v.model, v.summary);
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("(background AI anomaly check unavailable: {e})"),
+        }
+    }))
+}
+
+/// Wait for a background AI check spawned by [`spawn_ai_background_check`],
+/// if one is running, so its warning (if any) prints before the process
+/// exits. A no-op when no check was started.
+async fn join_ai_check(handle: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(h) = handle {
+        let _ = h.await;
+    }
 }
 
 /// Default location for a `qr-commit`/`qr-share` participant's local nonce

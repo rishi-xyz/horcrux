@@ -79,4 +79,9 @@ pub enum Error {
     /// The access log could not be read or written.
     #[error("audit log error: {0}")]
     Audit(String),
+
+    /// The AI anomaly check (OpenRouter) failed or returned something
+    /// unparseable. Always advisory — never a reason to block signing.
+    #[error("ai anomaly check error: {0}")]
+    Ai(String),
 }
