@@ -15,6 +15,7 @@ bitcoincore-rpc = "0.19.0"
 bs58 = "0.5"
 clap = { version = "4.6", features = ["derive"] }
 cosmrs = { version = "0.22", default-features = false, features = ["rpc", "tokio"] }
+crossterm = "0.29"
 ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] }
 frost-ed25519 = "3.0.0"
 frost-secp256k1-tr = "3.0.0"
@@ -23,6 +24,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 k256 = { version = "0.13", features = ["schnorr"] }
 qrcode = { version = "0.14.1", default-features = false }
 rand = "0.8"
+ratatui = "0.30"
 rpassword = "7"
 rqrr = { version = "0.11.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -38,6 +40,7 @@ solana-system-interface = { version = "3", features = ["bincode"] }
 solana-transaction = { version = "3", features = ["bincode"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tui-input = { version = "0.15", features = ["crossterm"] }
 vsss-rs = "5.4.0"
 zeroize = "1.8"
 

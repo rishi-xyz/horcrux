@@ -344,6 +344,15 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Resolve the access log path: an explicit override (e.g. a CLI/TUI
+/// `--log-file`/field value), else the `HORCRUX_ACCESS_LOG` environment
+/// variable, else the default `./horcrux-access.log`.
+pub fn resolve_log_path(explicit: Option<PathBuf>) -> PathBuf {
+    explicit
+        .or_else(|| std::env::var_os("HORCRUX_ACCESS_LOG").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("horcrux-access.log"))
+}
+
 /// Read the shard ids from shard files without decrypting anything.
 pub fn shard_ids(paths: &[PathBuf]) -> Result<Vec<u8>, Error> {
     paths.iter().map(|p| Ok(Shard::read(p)?.id)).collect()

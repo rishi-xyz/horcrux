@@ -1,3 +1,5 @@
+mod tui;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use horcrux::error::Error;
 use horcrux::tx::{TxParams, derive_address};
@@ -408,6 +410,8 @@ enum Command {
         #[arg(long)]
         password: Option<String>,
     },
+    /// Launch the interactive terminal UI.
+    Tui,
 }
 
 #[tokio::main]
@@ -1305,6 +1309,7 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Tui => tui::run().await?,
     }
     Ok(())
 }
@@ -1346,8 +1351,7 @@ fn audit_preflight(
 /// Resolve the access log path: `--log-file`, else `$HORCRUX_ACCESS_LOG`,
 /// else the default `./horcrux-access.log`.
 fn access_log_path(flag: Option<PathBuf>) -> PathBuf {
-    flag.or_else(|| std::env::var_os("HORCRUX_ACCESS_LOG").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("horcrux-access.log"))
+    horcrux::audit::resolve_log_path(flag)
 }
 
 /// Default location for a `qr-commit`/`qr-share` participant's local nonce
