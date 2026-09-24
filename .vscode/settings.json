@@ -1,0 +1,23 @@
+{
+    "files.watcherExclude": {
+        "**/.git/**": true,
+        "**/target/**": true,
+        "**/node_modules/**": true
+    },
+
+    "search.exclude": {
+        "**/target/**": true,
+        "**/node_modules/**": true
+    },
+
+    "files.exclude": {
+        "**/target": true,
+        "**/node_modules": true
+    },
+
+    "rust-analyzer.files.exclude": [
+        "target"
+    ],
+
+    "explorer.excludeGitIgnore": true
+}

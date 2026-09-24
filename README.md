@@ -492,9 +492,10 @@ Each module has a clearly defined responsibility to simplify auditing, testing, 
 | Encryption | AES-256-GCM |
 | Password KDF | Argon2id |
 | Zeroization | zeroize |
-| Elliptic Curve | Ed25519 (signing), secp256k1 (Shamir field) |
-| Chain Integration | solana-rpc-client (3.x split crates) |
-| MPC | FROST (frost-ed25519) |
+| Elliptic Curve | Ed25519 (Solana signing), secp256k1 (Shamir field, Bitcoin/Cosmos signing) |
+| Chain Integration | solana-rpc-client (Solana), bitcoincore-rpc (Bitcoin), cosmrs::rpc / tendermint-rpc (Cosmos) |
+| MPC | FROST (frost-ed25519 for Solana, frost-secp256k1-tr for Bitcoin Taproot) |
+| Air-gapped transport | HX3 frames over QR-code PNGs (`qrcode` + `image` + `rqrr`) or `.hx3` files |
 | AI | Rule-based scorer (z-scores + hard rules) |
 | Serialization | serde |
 | Storage | Binary Shard Files |
@@ -513,9 +514,14 @@ horcrux/
 │   ├── sss.rs          Shamir split & combine (vsss-rs)
 │   ├── crypto.rs       Argon2id + AES-256-GCM
 │   ├── shard.rs        HX1 shard file format
-│   ├── mpc.rs          Mode B FROST split & threshold sign
+│   ├── mpc.rs          Mode B FROST split & threshold sign (Solana/Ed25519)
+│   ├── btc_mpc.rs      Mode B FROST split & threshold sign (Bitcoin/secp256k1-tr)
+│   ├── qr.rs           HX3 frame format + QR-code PNG transport
+│   ├── qr_mpc.rs       air-gapped FROST protocol over HX3 messages
 │   ├── tx.rs           offline Solana transaction build/sign
-│   ├── chain.rs        RPC broadcast / blockhash / balance
+│   ├── bitcoin.rs      offline Bitcoin Taproot transaction build/sign
+│   ├── cosmos.rs       offline Cosmos bank.MsgSend build/sign
+│   ├── chain.rs        Solana RPC broadcast / blockhash / balance
 │   ├── audit.rs        access log + anomaly scorer
 │   ├── verify.rs       passive shard integrity checks
 │   └── error.rs        typed error enum
@@ -525,6 +531,8 @@ horcrux/
 │   ├── sign.rs
 │   ├── audit.rs
 │   ├── mpc.rs
+│   ├── btc_mpc.rs
+│   ├── qr.rs
 │   └── verify.rs
 │
 ├── agent/wayfinder/PLAN.md
@@ -660,9 +668,14 @@ HORCRUX exposes a simple command-line interface.
 horcrux
 ├── init
 ├── reconstruct
-├── sign
-├── mpc-split
-├── mpc-sign
+├── sign          (--chain solana|bitcoin|cosmos)
+├── mpc-split     (--chain solana|bitcoin)
+├── mpc-sign      (--chain solana|bitcoin)
+├── qr-request    (Mode B over an air-gapped QR transport)
+├── qr-commit
+├── qr-package
+├── qr-share
+├── qr-finalize
 ├── verify
 ├── log
 └── help
@@ -752,6 +765,47 @@ horcrux sign \
 The sender address is derived from the reconstructed key; when broadcasting,
 its balance is checked (airdrop lamports first with `solana airdrop 1 <addr>`).
 
+### Other chains
+
+`--chain` selects the chain (default `solana`); the same reconstructed
+secp256k1/Ed25519 seed signs all three, so one shard set spends from every
+chain's derived address.
+
+**Bitcoin** (offline Taproot key-path signing, BIP340/341/342):
+
+```bash
+horcrux sign \
+    ./usb/shard-1.hx ./usb/shard-2.hx --password guardian \
+    --chain bitcoin \
+    --to bc1p... \
+    --utxo <txid>:<vout>:<amount-sat> \
+    --amount-sat 60000 --fee-sat 10000
+```
+
+`--utxo` repeats per input. `--change-address` defaults to the sender's own
+P2TR address. `--broadcast` calls a Bitcoin Core node's `sendrawtransaction`
+(default `http://127.0.0.1:18443`, a regtest node; override with `--rpc-url`
+or `$HORCRUX_BTC_RPC_URL`, and authenticate with `--rpc-user`/
+`--rpc-password` if the node requires it).
+
+**Cosmos** (offline `bank.MsgSend`, `SIGN_MODE_DIRECT`):
+
+```bash
+horcrux sign \
+    ./usb/shard-1.hx ./usb/shard-2.hx --password guardian \
+    --chain cosmos \
+    --to cosmos1... --chain-id cosmoshub-4 \
+    --account-number 12345 --sequence 0 \
+    --amount 1000000 --denom uatom \
+    --gas 100000 --fee 5000
+```
+
+`--broadcast` calls a Tendermint RPC node's `/broadcast_tx_commit` (default
+`http://127.0.0.1:26657`; override with `--rpc-url` or
+`$HORCRUX_COSMOS_RPC_URL`) and waits for the transaction to be included in a
+block; a non-OK `CheckTx`/delivery result is reported as an error rather than
+a silent "success".
+
 Output
 
 ```
@@ -822,6 +876,81 @@ Aggregate
 ↓
 Valid Ed25519 Signature
 ```
+
+### Bitcoin Mode B
+
+`--chain bitcoin` on both `mpc-split` and `mpc-sign` runs the identical
+protocol over `frost-secp256k1-tr` (Zcash Foundation) instead of
+`frost-ed25519`, producing a BIP340 Schnorr signature under the BIP341
+Taproot tweak:
+
+```bash
+horcrux mpc-split --chain bitcoin --threshold 2 --shares 3 --out-dir ./btc-mpc
+horcrux mpc-sign \
+    ./btc-mpc/btc-mpc-1.hx ./btc-mpc/btc-mpc-2.hx \
+    --chain bitcoin --group-dir ./btc-mpc --password guardian \
+    --to bc1p... --utxo <txid>:<vout>:<amount-sat> \
+    --amount-sat 60000 --fee-sat 10000
+```
+
+Bitcoin share files use their own `HX4` magic (distinct from Solana's `HX2`
+and the SSS `HX1`, and from each other's `group.pub`/`group-btc.pub`), so
+files from different chains or protocols can never be cross-used. The
+tweaked group address equals the Bitcoin Mode A address for the same seed.
+`--chain cosmos` is rejected on both commands: Cosmos uses plain
+ECDSA/secp256k1, which needs a different threshold protocol
+(GG18/GG20/CGGMP21 — multiplicative-to-additive share conversion, Paillier
+encryption, zero-knowledge proofs) than FROST/Schnorr, and no mature audited
+Rust crate for it exists yet, so it is a deliberate scope boundary rather
+than an oversight.
+
+---
+
+## Air-Gapped QR Signing (Mode B over a real air gap)
+
+`qr-request` / `qr-commit` / `qr-package` / `qr-share` / `qr-finalize` run
+the same Solana FROST protocol as `mpc-sign`, but every protocol message
+(the signing request, each commitment, the signing package, each signature
+share) crosses as a real, independently scannable QR-code PNG file — or a
+`.hx3` file when a camera isn't available — instead of an in-process call.
+No process ever holds more than one participant's key share; the two
+machines never need to be on the same network, or even the same room, at the
+same time.
+
+```bash
+# Coordinator: build the request
+horcrux qr-request --group-dir ./mpc --to RecipientAddressBase58 \
+    --lamports 1000000000 --blockhash <recent-base58-blockhash> --dir ./qr
+
+# Each guardian (physically carries ./qr's PNGs to their own machine):
+horcrux qr-commit ./mpc/mpc-1.hx --password guardian --dir ./qr
+
+# Coordinator: once enough commitments have arrived
+horcrux qr-package --dir ./qr
+
+# Each guardian again, after the package PNG arrives:
+horcrux qr-share ./mpc/mpc-1.hx --password guardian --dir ./qr
+
+# Coordinator: once enough signature shares have arrived
+horcrux qr-finalize --dir ./qr --broadcast
+```
+
+- `--dir` is the "air gap": in a real deployment each step's output PNG is
+  photographed off one screen and scanned into the next machine; this CLI
+  writes/reads the same directory for scriptability, but the files are
+  exactly what would be encoded into and decoded from a physical QR code.
+- `--format hx3` writes/reads a single `.hx3` frame-collection file per
+  message instead of QR PNGs, for transports (USB drive, email) where a
+  camera isn't the right fit.
+- A guardian's round-1 nonces are kept in an encrypted local file next to
+  their share (`<share>.qr-nonce` by default, override with
+  `--nonce-file`) between `qr-commit` and `qr-share` — this file is local
+  device state, never written into `--dir`, and is deleted once `qr-share`
+  consumes it.
+- `qr-finalize` recovers the exact message that was signed from the
+  original request (no need to re-supply `--to`/`--lamports`/`--blockhash`),
+  verifies the aggregated signature, and optionally broadcasts it — the
+  result is identical to `mpc-sign`'s output.
 
 ---
 
@@ -919,19 +1048,28 @@ each shard's metadata rather than in a separate config.
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `HORCRUX_RPC_URL` | Solana JSON-RPC endpoint | `http://127.0.0.1:8899` |
+| `HORCRUX_BTC_RPC_URL` | Bitcoin Core RPC endpoint | `http://127.0.0.1:18443` |
+| `HORCRUX_COSMOS_RPC_URL` | Cosmos Tendermint RPC endpoint | `http://127.0.0.1:26657` |
 | `HORCRUX_ACCESS_LOG` | Access log path | `./horcrux-access.log` |
 
 ## CLI Flags
 
 | Flag | Applies to | Purpose |
 |------|------------|---------|
+| `--chain` | `sign`, `mpc-split`, `mpc-sign` | `solana` (default) / `bitcoin` / `cosmos` (`mpc-*` rejects `cosmos`) |
 | `--threshold` / `--shares` | `init`, `mpc-split` | Threshold / total shares (default 2-of-3) |
 | `--password` | all split/sign commands | Shared guardian password (else prompt per shard) |
 | `--out-dir` | `init`, `mpc-split` | Where shard files are written |
-| `--group-dir` | `mpc-sign` | Directory containing `group.pub` |
-| `--to` / `--lamports` / `--blockhash` | `sign`, `mpc-sign` | Transaction parameters |
-| `--broadcast` / `--rpc-url` | `sign`, `mpc-sign` | Submit the signed tx to the cluster |
-| `--log-file` / `--force` | `sign`, `mpc-sign`, `reconstruct` | Audit log path / override a block |
+| `--group-dir` | `mpc-sign` | Directory containing the group public key package |
+| `--to` / `--lamports` / `--blockhash` | `sign`, `mpc-sign` (Solana) | Transaction parameters |
+| `--utxo` / `--amount-sat` / `--fee-sat` / `--change-address` | `sign`, `mpc-sign` (Bitcoin) | Transaction parameters |
+| `--chain-id` / `--account-number` / `--sequence` / `--amount` / `--denom` / `--gas` / `--fee` | `sign` (Cosmos) | Transaction parameters |
+| `--broadcast` / `--rpc-url` | `sign`, `mpc-sign` | Submit the signed tx to the network |
+| `--rpc-user` / `--rpc-password` | `sign`, `mpc-sign` (Bitcoin) | Bitcoin Core RPC auth |
+| `--dir` | `qr-*` | Air-gap transport directory |
+| `--format` | `qr-*` | `qr` (PNG images, default) or `hx3` (files) |
+| `--nonce-file` | `qr-commit`, `qr-share` | Local round-1 nonce state (defaults next to the share) |
+| `--log-file` / `--force` | `sign`, `mpc-sign`, `reconstruct`, `qr-commit`, `qr-share` | Audit log path / override a block |
 
 ---
 
@@ -1338,8 +1476,10 @@ Rust reduces classes of vulnerabilities common in systems programming.
 - SSS
 - AES Encryption
 - USB Storage
-- Mode A Signing
-- Mode B FROST Signing
+- Mode A Signing (Solana, Bitcoin, Cosmos)
+- Mode B FROST Signing (Solana, Bitcoin)
+- QR-Based Air-Gapped Mode B (Solana)
+- Multi-Chain Signing (Solana, Bitcoin, Cosmos)
 - Logging
 - AI Detection
 
@@ -1348,9 +1488,8 @@ Rust reduces classes of vulnerabilities common in systems programming.
 ## Planned
 
 - Tauri Desktop GUI
-- QR-based Air Gap MPC
 - Proactive Secret Refresh
-- Multi-chain Support
+- Cosmos Mode B (needs an audited threshold-ECDSA crate; none exists yet)
 - Hardware Wallet Integration
 - Hardware Security Module Support
 - Secure Firmware Verification

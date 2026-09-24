@@ -478,3 +478,295 @@ fn is_png_file(path: &std::path::Path) -> bool {
     };
     head.len() >= PNG_MAGIC.len() && &head[..PNG_MAGIC.len()] == PNG_MAGIC
 }
+
+/// How a message crosses the air gap: as a set of scannable QR-code PNGs (the
+/// literal "photograph the code" path), or as a single `.hx3` file (a
+/// stand-in for physically carrying a file, e.g. on a USB drive, when a
+/// camera isn't available — the same convention [`crate::mpc`] already uses
+/// for share files).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// One PNG QR code per frame.
+    Qr,
+    /// A single `.hx3` frame-collection file.
+    Hx3,
+}
+
+/// Pixel size of each QR module when rendering [`Transport::Qr`] output. Large
+/// enough to scan reliably from a phone camera at arm's length.
+const QR_SCALE: u32 = 6;
+
+/// Write a complete message across the air gap into `dir`, named by `prefix`:
+/// either one QR PNG per frame (`{prefix}-{index}.png`) or a single `.hx3`
+/// collection (`{prefix}.hx3`). Returns the written file paths.
+pub fn write_message_transport(
+    dir: &std::path::Path,
+    prefix: &str,
+    format: Transport,
+    message_type: MessageType,
+    session: [u8; SESSION_LEN],
+    payload: &[u8],
+) -> Result<Vec<std::path::PathBuf>, Error> {
+    std::fs::create_dir_all(dir).map_err(Error::Io)?;
+    let frames = encode_message(message_type, session, payload)?;
+    match format {
+        Transport::Hx3 => {
+            let path = dir.join(format!("{prefix}.hx3"));
+            std::fs::write(&path, serialize_frames(&frames)).map_err(Error::Io)?;
+            Ok(vec![path])
+        }
+        Transport::Qr => frames
+            .iter()
+            .map(|frame| {
+                let path = dir.join(format!("{prefix}-{}.png", frame.index));
+                write_qr_png(frame, &path, QR_SCALE)?;
+                Ok(path)
+            })
+            .collect(),
+    }
+}
+
+/// Read a complete message written by [`write_message_transport`] under
+/// `prefix` in `dir`, auto-detecting a `.hx3` file or a set of QR PNGs.
+pub fn read_message_transport(
+    dir: &std::path::Path,
+    prefix: &str,
+) -> Result<(MessageType, [u8; SESSION_LEN], Vec<u8>), Error> {
+    let hx3_path = dir.join(format!("{prefix}.hx3"));
+    if hx3_path.is_file() {
+        return read_message_file(&hx3_path);
+    }
+    let png_prefix = format!("{prefix}-");
+    let png_paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map_err(Error::Io)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&png_prefix) && n.ends_with(".png"))
+        })
+        .collect();
+    if png_paths.is_empty() {
+        return Err(Error::Hx3(format!(
+            "no {prefix}.hx3 or {prefix}-*.png found in {}",
+            dir.display()
+        )));
+    }
+    // Order is irrelevant: assemble_message places each frame by its own
+    // index, not by input order.
+    let frames: Vec<Frame> = png_paths
+        .iter()
+        .map(|p| read_qr_png(p))
+        .collect::<Result<_, _>>()?;
+    assemble_message(&frames)
+}
+
+/// List the distinct participant ids present in `dir` for a multi-participant
+/// prefix stem (e.g. `"commit"` or `"share"`): scans for `{stem}-{id}.hx3` and
+/// `{stem}-{id}-{index}.png`. Used by the coordinator to discover which
+/// participants have responded without needing an out-of-band roster.
+pub fn list_participant_ids(dir: &std::path::Path, stem: &str) -> Result<Vec<u8>, Error> {
+    let mut ids = std::collections::BTreeSet::new();
+    let file_prefix = format!("{stem}-");
+    for entry in std::fs::read_dir(dir).map_err(Error::Io)? {
+        let entry = entry.map_err(Error::Io)?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix(&file_prefix) else {
+            continue;
+        };
+        let id_token = rest.split(['-', '.']).next().unwrap_or("");
+        if let Ok(id) = id_token.parse::<u8>() {
+            ids.insert(id);
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> [u8; SESSION_LEN] {
+        [0x42; SESSION_LEN]
+    }
+
+    #[test]
+    fn frame_wire_round_trip() {
+        let frame = Frame {
+            message_type: MessageType::Commitment,
+            session: session(),
+            index: 0,
+            total: 1,
+            payload: b"hello frame".to_vec(),
+        };
+        let bytes = frame.to_bytes();
+        assert_eq!(Frame::from_bytes(&bytes).expect("parse"), frame);
+    }
+
+    #[test]
+    fn base58_round_trip() {
+        let frame = Frame {
+            message_type: MessageType::SignatureShare,
+            session: session(),
+            index: 2,
+            total: 5,
+            payload: vec![1, 2, 3, 4, 5],
+        };
+        let text = frame.to_base58();
+        assert_eq!(Frame::from_base58(&text).expect("parse"), frame);
+    }
+
+    #[test]
+    fn small_message_is_a_single_frame() {
+        let frames = encode_message(MessageType::Request, session(), b"tiny").expect("encode");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].total, 1);
+        let (ty, sess, payload) = assemble_message(&frames).expect("assemble");
+        assert_eq!(ty, MessageType::Request);
+        assert_eq!(sess, session());
+        assert_eq!(payload, b"tiny");
+    }
+
+    #[test]
+    fn large_message_splits_into_multiple_frames_and_reassembles() {
+        let payload: Vec<u8> = (0..(MAX_FRAME_PAYLOAD * 3 + 17))
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let frames = encode_message(MessageType::SigningPackage, session(), &payload)
+            .expect("encode large message");
+        assert_eq!(frames.len(), 4, "3 full frames + 1 partial frame");
+        assert!(frames.iter().all(|f| f.total == 4));
+
+        // Reassembly must not depend on frame order.
+        let mut shuffled = frames.clone();
+        shuffled.reverse();
+        let (ty, sess, reassembled) = assemble_message(&shuffled).expect("assemble");
+        assert_eq!(ty, MessageType::SigningPackage);
+        assert_eq!(sess, session());
+        assert_eq!(reassembled, payload);
+    }
+
+    #[test]
+    fn assemble_rejects_incomplete_or_mismatched_frames() {
+        let payload = vec![7u8; MAX_FRAME_PAYLOAD * 2 + 1];
+        let frames = encode_message(MessageType::Commitment, session(), &payload).expect("encode");
+        assert_eq!(frames.len(), 3);
+
+        // Missing a frame.
+        assert!(assemble_message(&frames[..2]).is_err());
+
+        // Mismatched session.
+        let mut bad = frames.clone();
+        bad[0].session = [0xAA; SESSION_LEN];
+        assert!(assemble_message(&bad).is_err());
+    }
+
+    #[test]
+    fn hx3_file_round_trip_multi_frame() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = vec![9u8; MAX_FRAME_PAYLOAD * 2 + 30];
+        let path = dir.path().join("msg.hx3");
+        write_message_file(&path, MessageType::Request, session(), &payload).expect("write");
+        let (ty, sess, read_back) = read_message_file(&path).expect("read");
+        assert_eq!(ty, MessageType::Request);
+        assert_eq!(sess, session());
+        assert_eq!(read_back, payload);
+    }
+
+    #[test]
+    fn qr_png_round_trip_at_max_frame_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = vec![0x5Au8; MAX_FRAME_PAYLOAD];
+        let frames = encode_message(MessageType::Request, session(), &payload).expect("encode");
+        assert_eq!(frames.len(), 1, "must fit in exactly one frame");
+
+        let path = dir.path().join("frame.png");
+        write_qr_png(&frames[0], &path, 4).expect("write qr png");
+        let decoded = read_qr_png(&path).expect("decode qr png");
+        assert_eq!(decoded, frames[0]);
+    }
+
+    #[test]
+    fn message_transport_hx3_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = b"a signing request payload".to_vec();
+        write_message_transport(
+            dir.path(),
+            "request",
+            Transport::Hx3,
+            MessageType::Request,
+            session(),
+            &payload,
+        )
+        .expect("write");
+        let (ty, sess, read_back) = read_message_transport(dir.path(), "request").expect("read");
+        assert_eq!(ty, MessageType::Request);
+        assert_eq!(sess, session());
+        assert_eq!(read_back, payload);
+    }
+
+    #[test]
+    fn message_transport_qr_round_trip_multi_frame() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = vec![0x11u8; MAX_FRAME_PAYLOAD + 40];
+        let paths = write_message_transport(
+            dir.path(),
+            "package",
+            Transport::Qr,
+            MessageType::SigningPackage,
+            session(),
+            &payload,
+        )
+        .expect("write");
+        assert_eq!(paths.len(), 2, "payload needs two QR frames");
+        assert!(paths.iter().all(|p| p.extension().unwrap() == "png"));
+
+        let (ty, sess, read_back) = read_message_transport(dir.path(), "package").expect("read");
+        assert_eq!(ty, MessageType::SigningPackage);
+        assert_eq!(sess, session());
+        assert_eq!(read_back, payload);
+    }
+
+    #[test]
+    fn list_participant_ids_scans_both_transports() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_message_transport(
+            dir.path(),
+            "commit-1",
+            Transport::Hx3,
+            MessageType::Commitment,
+            session(),
+            b"c1",
+        )
+        .expect("write 1");
+        write_message_transport(
+            dir.path(),
+            "commit-3",
+            Transport::Qr,
+            MessageType::Commitment,
+            session(),
+            b"c3",
+        )
+        .expect("write 3");
+
+        let ids = list_participant_ids(dir.path(), "commit").expect("list");
+        assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn terminal_qr_renders_a_non_empty_grid() {
+        let frame = Frame {
+            message_type: MessageType::Request,
+            session: session(),
+            index: 0,
+            total: 1,
+            payload: b"terminal".to_vec(),
+        };
+        let rendered = terminal_qr(&frame);
+        assert!(!rendered.is_empty());
+        assert!(rendered.contains('\n'));
+    }
+}

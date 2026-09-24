@@ -177,6 +177,46 @@ pub fn sign_transaction_with_signature(
     })
 }
 
+/// Assemble a signed transaction from a pre-built [`Message`] and an
+/// externally produced Ed25519 signature. Unlike
+/// [`sign_transaction_with_signature`], this doesn't need [`TxParams`]: the
+/// message is taken as-is (e.g. recovered verbatim from a
+/// [`crate::qr_mpc::RequestData`] on the coordinator side of the air-gapped
+/// QR flow, where the exact bytes that were signed must be reused rather than
+/// rebuilt from scratch).
+///
+/// The signature is verified against the serialized message before the
+/// transaction is returned, so an invalid aggregate cannot yield a
+/// broadcastable transaction.
+pub fn assemble_signed_transaction(
+    message: Message,
+    signature: [u8; 64],
+    verifying_key: [u8; 32],
+) -> Result<SignedTx, Error> {
+    let from = Pubkey::from(verifying_key);
+    let sign_bytes = message.serialize();
+
+    use ed25519_dalek::Verifier as _;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&verifying_key)
+        .map_err(|e| Error::Tx(format!("invalid verifying key: {e}")))?;
+    let dalek_sig = ed25519_dalek::Signature::from_bytes(&signature);
+    if vk.verify(&sign_bytes, &dalek_sig).is_err() {
+        return Err(Error::Tx(
+            "signature failed local verification against the serialized message".into(),
+        ));
+    }
+
+    let signature = Signature::from(signature);
+    Ok(SignedTx {
+        from,
+        tx: Transaction {
+            signatures: vec![signature],
+            message,
+        },
+        signature,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

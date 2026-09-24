@@ -80,6 +80,41 @@ impl SignedCosmosTx {
     }
 }
 
+/// Default Tendermint RPC endpoint (a local `simd`/`gaiad` node), overridden
+/// by `--rpc-url` or `$HORCRUX_COSMOS_RPC_URL`.
+pub fn default_rpc_url() -> String {
+    std::env::var("HORCRUX_COSMOS_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:26657".to_string())
+}
+
+/// Broadcast a signed transaction via `/broadcast_tx_commit` and wait for it
+/// to be included in a block. Returns the transaction hash on success; a
+/// non-OK `CheckTx` or delivery result is reported as an error rather than a
+/// silently "successful" broadcast of a rejected transaction.
+pub async fn broadcast(rpc_url: &str, tx: &SignedCosmosTx) -> Result<String, Error> {
+    use cosmrs::rpc::Client as _;
+
+    let client = cosmrs::rpc::HttpClient::new(rpc_url)
+        .map_err(|e| Error::Cosmos(format!("failed to connect to {rpc_url}: {e}")))?;
+    let response = client
+        .broadcast_tx_commit(tx.raw_bytes.clone())
+        .await
+        .map_err(|e| Error::Cosmos(format!("broadcast failed: {e}")))?;
+
+    if response.check_tx.code.is_err() {
+        return Err(Error::Cosmos(format!(
+            "check_tx rejected the transaction: code {:?}: {}",
+            response.check_tx.code, response.check_tx.log
+        )));
+    }
+    if response.tx_result.code.is_err() {
+        return Err(Error::Cosmos(format!(
+            "transaction delivery failed: code {:?}: {}",
+            response.tx_result.code, response.tx_result.log
+        )));
+    }
+    Ok(response.hash.to_string())
+}
+
 /// Parse a bech32 Cosmos account address.
 pub fn parse_address(s: &str) -> Result<AccountId, Error> {
     s.parse()

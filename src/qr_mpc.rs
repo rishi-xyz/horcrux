@@ -356,6 +356,67 @@ pub fn produce_signature_share(
     })
 }
 
+/// Length of the local nonce-file header (Argon2id salt || AES-GCM nonce).
+const NONCE_FILE_HEADER_LEN: usize = crate::SALT_LEN + crate::NONCE_LEN;
+
+/// Encrypt round-1 [`frost::round1::SigningNonces`] to a local file so they
+/// survive between the `qr-commit` and `qr-share` CLI invocations, which run
+/// as separate processes.
+///
+/// # Security
+///
+/// This file is local device state, not an air-gap artifact: it must never
+/// be written into the directory that crosses the air gap, and must be
+/// deleted immediately after round 2 completes (a leaked, reused, or
+/// replayed nonce can leak the signer's key share). It is bound to `session`
+/// via AES-GCM AAD, so it cannot be replayed into a different signing
+/// attempt even if it survives.
+pub fn save_nonces(
+    path: &Path,
+    password: &str,
+    session: &[u8; SESSION_LEN],
+    nonces: &frost::round1::SigningNonces,
+) -> Result<(), Error> {
+    let bytes = nonces
+        .serialize()
+        .map_err(|e| Error::Mpc(format!("failed to serialize nonces: {e}")))?;
+    let salt = crate::crypto::random_salt();
+    let aes_nonce = crate::crypto::random_nonce();
+    let sealed = crate::crypto::seal(&bytes, password, &salt, &aes_nonce, session)?;
+    let mut out = Vec::with_capacity(NONCE_FILE_HEADER_LEN + sealed.len());
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&aes_nonce);
+    out.extend_from_slice(&sealed);
+    std::fs::write(path, out).map_err(Error::Io)
+}
+
+/// Decrypt round-1 nonces previously written by [`save_nonces`]. Bound to
+/// `session`, so a nonce file from a different signing attempt is rejected.
+pub fn load_nonces(
+    path: &Path,
+    password: &str,
+    session: &[u8; SESSION_LEN],
+) -> Result<frost::round1::SigningNonces, Error> {
+    let bytes = std::fs::read(path).map_err(Error::Io)?;
+    if bytes.len() < NONCE_FILE_HEADER_LEN {
+        return Err(Error::Hx3("nonce file is truncated".into()));
+    }
+    let salt: [u8; crate::SALT_LEN] = bytes[..crate::SALT_LEN].try_into().unwrap();
+    let aes_nonce: [u8; crate::NONCE_LEN] = bytes[crate::SALT_LEN..NONCE_FILE_HEADER_LEN]
+        .try_into()
+        .unwrap();
+    let sealed = &bytes[NONCE_FILE_HEADER_LEN..];
+    let payload =
+        crate::crypto::open(sealed, password, &salt, &aes_nonce, session).map_err(|e| {
+            Error::Decrypt {
+                id: 0,
+                reason: e.to_string(),
+            }
+        })?;
+    frost::round1::SigningNonces::deserialize(&payload)
+        .map_err(|e| Error::Mpc(format!("invalid nonce payload: {e}")))
+}
+
 /// Map a `u8` participant id to the FROST identifier used by the default split
 /// (the little-endian scalar `id`, matching `FrostShare.id`).
 fn identifier_from_u8(id: u8) -> Result<frost::Identifier, Error> {

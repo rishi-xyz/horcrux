@@ -17,6 +17,24 @@ enum ChainKind {
     Cosmos,
 }
 
+/// How a `qr-*` command moves a message across the air gap.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TransportArg {
+    /// One scannable QR-code PNG per frame.
+    Qr,
+    /// A single `.hx3` frame-collection file.
+    Hx3,
+}
+
+impl From<TransportArg> for horcrux::qr::Transport {
+    fn from(value: TransportArg) -> Self {
+        match value {
+            TransportArg::Qr => horcrux::qr::Transport::Qr,
+            TransportArg::Hx3 => horcrux::qr::Transport::Hx3,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "horcrux",
@@ -93,13 +111,23 @@ enum Command {
         /// cluster when broadcasting. Solana only.
         #[arg(long)]
         blockhash: Option<String>,
-        /// Solana JSON-RPC endpoint (overrides $HORCRUX_RPC_URL). Solana only.
+        /// RPC endpoint (overrides $HORCRUX_RPC_URL for Solana,
+        /// $HORCRUX_BTC_RPC_URL for Bitcoin, $HORCRUX_COSMOS_RPC_URL for
+        /// Cosmos).
         #[arg(long)]
         rpc_url: Option<String>,
-        /// Broadcast the signed transaction and wait for confirmation.
-        /// Solana only.
+        /// Broadcast the signed transaction (Solana: wait for confirmation;
+        /// Bitcoin: `sendrawtransaction`; Cosmos: `broadcast_tx_commit`).
         #[arg(long)]
         broadcast: bool,
+        /// Bitcoin Core RPC username, if the node requires authentication.
+        /// Bitcoin only.
+        #[arg(long)]
+        rpc_user: Option<String>,
+        /// Bitcoin Core RPC password, if the node requires authentication.
+        /// Bitcoin only.
+        #[arg(long)]
+        rpc_password: Option<String>,
         /// Spend a UTXO as `<txid>:<vout>:<amount-sat>`, repeating as needed.
         /// Bitcoin only.
         #[arg(long)]
@@ -156,8 +184,14 @@ enum Command {
     },
     /// Dealer-split a key into encrypted FROST key shares (Mode B). Signing
     /// later combines a threshold subset of these shares without ever
-    /// reconstructing the key.
+    /// reconstructing the key. `--chain cosmos` is rejected: Cosmos uses
+    /// plain ECDSA/secp256k1, which needs a different threshold protocol
+    /// (GG18/GG20/CGGMP21) than FROST — see the Mode B section of the plan.
     MpcSplit {
+        /// Chain to split the key for (selects the FROST curve/ciphersuite
+        /// and share file naming). `cosmos` is not supported.
+        #[arg(long, value_enum, default_value_t = ChainKind::Solana)]
+        chain: ChainKind,
         /// Shares required to sign.
         #[arg(long, default_value_t = 2)]
         threshold: u8,
@@ -170,41 +204,71 @@ enum Command {
         /// Generate a random disposable test key and print it once.
         #[arg(long)]
         generate: bool,
-        /// Directory to write share files and group.pub into.
+        /// Directory to write share files and the group public key package
+        /// into.
         #[arg(long, default_value = "mpc")]
         out_dir: PathBuf,
         /// Use this password for every share (else prompt per share).
         #[arg(long)]
         password: Option<String>,
     },
-    /// Sign a Solana transaction with a threshold FROST subset of key shares,
-    /// optionally broadcasting to a cluster (Mode B).
+    /// Sign a transaction with a threshold FROST subset of key shares,
+    /// optionally broadcasting (Mode B). Choose the chain with `--chain`;
+    /// `cosmos` is not supported (see `mpc-split`).
     MpcSign {
         /// Paths of the FROST share files to combine.
         #[arg(required = true)]
         shares: Vec<PathBuf>,
-        /// Directory containing the group public key package (group.pub).
+        /// Chain to build the transaction for.
+        #[arg(long, value_enum, default_value_t = ChainKind::Solana)]
+        chain: ChainKind,
+        /// Directory containing the group public key package.
         #[arg(long, default_value = "mpc")]
         group_dir: PathBuf,
         /// Use this password for every share (else prompt per share).
         #[arg(long)]
         password: Option<String>,
-        /// Recipient address (base58).
+        /// Recipient address (base58 Solana pubkey, or bech32 for Bitcoin).
         #[arg(long)]
         to: String,
         /// Amount to send, in lamports (1 SOL = 1_000_000_000 lamports).
+        /// Solana only.
         #[arg(long)]
-        lamports: u64,
+        lamports: Option<u64>,
         /// Recent blockhash (base58). Required offline; fetched from the
-        /// cluster when broadcasting.
+        /// cluster when broadcasting. Solana only.
         #[arg(long)]
         blockhash: Option<String>,
-        /// Solana JSON-RPC endpoint (overrides $HORCRUX_RPC_URL).
+        /// RPC endpoint (overrides $HORCRUX_RPC_URL for Solana,
+        /// $HORCRUX_BTC_RPC_URL for Bitcoin).
         #[arg(long)]
         rpc_url: Option<String>,
-        /// Broadcast the signed transaction and wait for confirmation.
+        /// Broadcast the signed transaction (Solana: wait for confirmation;
+        /// Bitcoin: `sendrawtransaction`).
         #[arg(long)]
         broadcast: bool,
+        /// Bitcoin Core RPC username, if the node requires authentication.
+        /// Bitcoin only.
+        #[arg(long)]
+        rpc_user: Option<String>,
+        /// Bitcoin Core RPC password, if the node requires authentication.
+        /// Bitcoin only.
+        #[arg(long)]
+        rpc_password: Option<String>,
+        /// Spend a UTXO as `<txid>:<vout>:<amount-sat>`, repeating as needed.
+        /// Bitcoin only.
+        #[arg(long)]
+        utxo: Vec<String>,
+        /// Amount to send to the recipient, in satoshis. Bitcoin only.
+        #[arg(long)]
+        amount_sat: Option<u64>,
+        /// Change destination (bech32, mainnet). Defaults to the group's own
+        /// P2TR address. Bitcoin only.
+        #[arg(long)]
+        change_address: Option<String>,
+        /// Explicit miner fee, in satoshis. Bitcoin only.
+        #[arg(long)]
+        fee_sat: Option<u64>,
         /// Access log file (default: ./horcrux-access.log or
         /// $HORCRUX_ACCESS_LOG).
         #[arg(long)]
@@ -225,6 +289,112 @@ enum Command {
         /// Print raw JSON-lines instead of a human-readable table.
         #[arg(long)]
         json: bool,
+    },
+    /// Air-gapped Mode B, step 1 (coordinator): build a Solana transfer and
+    /// emit it as a signing request, in `--dir`, for participants to accept.
+    /// Uses Solana FROST key shares from `horcrux mpc-split` (Ed25519).
+    QrRequest {
+        /// Directory containing the group public key package (group.pub).
+        #[arg(long, default_value = "mpc")]
+        group_dir: PathBuf,
+        /// Recipient address (base58).
+        #[arg(long)]
+        to: String,
+        /// Amount to send, in lamports (1 SOL = 1_000_000_000 lamports).
+        #[arg(long)]
+        lamports: u64,
+        /// Recent blockhash (base58). The QR flow is fully offline, so this
+        /// must be supplied (no cluster fetch).
+        #[arg(long)]
+        blockhash: String,
+        /// Air-gap transport directory (stands in for the physical QR
+        /// codes/files carried between machines).
+        #[arg(long, default_value = "qr")]
+        dir: PathBuf,
+        /// Transport format: real QR-code PNGs, or `.hx3` files.
+        #[arg(long, value_enum, default_value_t = TransportArg::Qr)]
+        format: TransportArg,
+    },
+    /// Air-gapped Mode B, step 2 (participant): accept a signing request,
+    /// decrypt this guardian's share, and emit a round-1 commitment.
+    QrCommit {
+        /// Path of this guardian's FROST share file.
+        share: PathBuf,
+        /// Guardian password for the share (else prompt).
+        #[arg(long)]
+        password: Option<String>,
+        /// Air-gap transport directory (same one the coordinator used).
+        #[arg(long, default_value = "qr")]
+        dir: PathBuf,
+        /// Where to keep this participant's round-1 nonces until `qr-share`
+        /// runs (local device state; never written into `--dir`). Defaults
+        /// to a file next to the share.
+        #[arg(long)]
+        nonce_file: Option<PathBuf>,
+        /// Transport format for the emitted commitment.
+        #[arg(long, value_enum, default_value_t = TransportArg::Qr)]
+        format: TransportArg,
+        /// Access log file (default: ./horcrux-access.log or
+        /// $HORCRUX_ACCESS_LOG).
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+        /// Bypass audit blocking (blocked attempts are still logged).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Air-gapped Mode B, step 3 (coordinator): assemble the signing package
+    /// from the commitments collected so far in `--dir`.
+    QrPackage {
+        /// Air-gap transport directory.
+        #[arg(long, default_value = "qr")]
+        dir: PathBuf,
+        /// Transport format for the emitted signing package.
+        #[arg(long, value_enum, default_value_t = TransportArg::Qr)]
+        format: TransportArg,
+    },
+    /// Air-gapped Mode B, step 4 (participant): accept the signing package
+    /// and emit this guardian's signature share.
+    QrShare {
+        /// Path of this guardian's FROST share file (same as `qr-commit`).
+        share: PathBuf,
+        /// Guardian password for the share (else prompt).
+        #[arg(long)]
+        password: Option<String>,
+        /// Air-gap transport directory.
+        #[arg(long, default_value = "qr")]
+        dir: PathBuf,
+        /// Where this participant's round-1 nonces were kept by `qr-commit`.
+        /// Deleted after producing the signature share.
+        #[arg(long)]
+        nonce_file: Option<PathBuf>,
+        /// Transport format for the emitted signature share.
+        #[arg(long, value_enum, default_value_t = TransportArg::Qr)]
+        format: TransportArg,
+        /// Access log file (default: ./horcrux-access.log or
+        /// $HORCRUX_ACCESS_LOG).
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+        /// Bypass audit blocking (blocked attempts are still logged).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Air-gapped Mode B, step 5 (coordinator): aggregate the collected
+    /// signature shares into the final signed transaction, optionally
+    /// broadcasting it.
+    QrFinalize {
+        /// Air-gap transport directory.
+        #[arg(long, default_value = "qr")]
+        dir: PathBuf,
+        /// Solana JSON-RPC endpoint (overrides $HORCRUX_RPC_URL).
+        #[arg(long)]
+        rpc_url: Option<String>,
+        /// Broadcast the signed transaction and wait for confirmation.
+        #[arg(long)]
+        broadcast: bool,
+        /// Access log file (default: ./horcrux-access.log or
+        /// $HORCRUX_ACCESS_LOG).
+        #[arg(long)]
+        log_file: Option<PathBuf>,
     },
     /// Check shard/share files for structural integrity (magic, version,
     /// length, split consistency) and, with a password, the AES-GCM
@@ -283,6 +453,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::MpcSplit {
+            chain,
             threshold,
             shares,
             key_hex,
@@ -290,6 +461,13 @@ async fn main() -> anyhow::Result<()> {
             out_dir,
             password,
         } => {
+            if chain == ChainKind::Cosmos {
+                anyhow::bail!(
+                    "Mode B (FROST) is not supported for Cosmos: it uses plain ECDSA/secp256k1, \
+                     which needs a different threshold protocol (GG18/GG20/CGGMP21) than FROST, \
+                     and no audited Rust crate for that exists yet"
+                );
+            }
             let key = match (&key_hex, generate) {
                 (Some(hex_key), _) => parse_key(hex_key)?,
                 (None, true) => {
@@ -309,8 +487,15 @@ async fn main() -> anyhow::Result<()> {
                 true,
             )?;
 
-            let (paths, group_path) =
-                horcrux::mpc::mpc_split(&key, threshold, shares, &out_dir, &passwords)?;
+            let (paths, group_path) = match chain {
+                ChainKind::Solana => {
+                    horcrux::mpc::mpc_split(&key, threshold, shares, &out_dir, &passwords)?
+                }
+                ChainKind::Bitcoin => {
+                    horcrux::btc_mpc::btc_mpc_split(&key, threshold, shares, &out_dir, &passwords)?
+                }
+                ChainKind::Cosmos => unreachable!("rejected above"),
+            };
             println!(
                 "Wrote {n} FROST key shares to {dir} (threshold {t}):",
                 n = paths.len(),
@@ -358,6 +543,8 @@ async fn main() -> anyhow::Result<()> {
             blockhash,
             rpc_url,
             broadcast,
+            rpc_user,
+            rpc_password,
             utxo,
             amount_sat,
             change_address,
@@ -463,11 +650,6 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 ChainKind::Bitcoin => {
-                    if broadcast || rpc_url.is_some() {
-                        anyhow::bail!(
-                            "--broadcast/--rpc-url are only supported for the solana chain"
-                        );
-                    }
                     let recipient = horcrux::bitcoin::parse_address(&to)?;
                     let utxos = utxo
                         .iter()
@@ -504,11 +686,23 @@ async fn main() -> anyhow::Result<()> {
                     println!("Change:    {} sat", signed.change_sat());
                     println!("Signature: {}", hex::encode(signed.signature()));
                     println!("Raw:       {}", signed.raw_hex());
+
+                    if broadcast {
+                        let rpc_url = rpc_url.unwrap_or_else(horcrux::bitcoin::default_rpc_url);
+                        println!("Broadcasting via {rpc_url}");
+                        let txid = horcrux::bitcoin::broadcast(
+                            &rpc_url,
+                            rpc_user.as_deref(),
+                            rpc_password.as_deref(),
+                            signed.tx(),
+                        )?;
+                        println!("Mined:     {txid} (accepted by mempool)");
+                    }
                 }
                 ChainKind::Cosmos => {
-                    if broadcast || rpc_url.is_some() {
+                    if rpc_user.is_some() || rpc_password.is_some() {
                         anyhow::bail!(
-                            "--broadcast/--rpc-url are only supported for the solana chain"
+                            "--rpc-user/--rpc-password are only supported for the bitcoin chain"
                         );
                     }
                     let to = horcrux::cosmos::parse_address(&to)?;
@@ -552,11 +746,19 @@ async fn main() -> anyhow::Result<()> {
                     let signed = horcrux::cosmos::sign_transaction(*seed, params)?;
                     println!("From:      {}", signed.from());
                     println!("Raw:       {}", signed.raw_hex());
+
+                    if broadcast {
+                        let rpc_url = rpc_url.unwrap_or_else(horcrux::cosmos::default_rpc_url);
+                        println!("Broadcasting via {rpc_url}");
+                        let tx_hash = horcrux::cosmos::broadcast(&rpc_url, &signed).await?;
+                        println!("Mined:     {tx_hash} (committed)");
+                    }
                 }
             }
         }
         Command::MpcSign {
             shares,
+            chain: chain_kind,
             group_dir,
             password,
             to,
@@ -564,9 +766,22 @@ async fn main() -> anyhow::Result<()> {
             blockhash,
             rpc_url,
             broadcast,
+            rpc_user,
+            rpc_password,
+            utxo,
+            amount_sat,
+            change_address,
+            fee_sat,
             log_file,
             force,
         } => {
+            if chain_kind == ChainKind::Cosmos {
+                anyhow::bail!(
+                    "Mode B (FROST) is not supported for Cosmos: it uses plain ECDSA/secp256k1, \
+                     which needs a different threshold protocol (GG18/GG20/CGGMP21) than FROST, \
+                     and no audited Rust crate for that exists yet"
+                );
+            }
             let passwords = collect_passwords(
                 shares.len(),
                 password,
@@ -580,9 +795,78 @@ async fn main() -> anyhow::Result<()> {
                 false,
             )?;
 
+            if chain_kind == ChainKind::Bitcoin {
+                let recipient = horcrux::bitcoin::parse_address(&to)?;
+                let utxos = utxo
+                    .iter()
+                    .map(|s| parse_utxo(s))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let amount_sat = amount_sat.ok_or_else(|| {
+                    anyhow::anyhow!("--amount-sat is required for the bitcoin chain")
+                })?;
+                let fee_sat = fee_sat.ok_or_else(|| {
+                    anyhow::anyhow!("--fee-sat is required for the bitcoin chain")
+                })?;
+                let change_address = change_address
+                    .as_deref()
+                    .map(horcrux::bitcoin::parse_address)
+                    .transpose()?;
+
+                let group_pub = group_dir.join(horcrux::btc_mpc::BTC_GROUP_PUB_FILENAME);
+                let output_xonly = horcrux::btc_mpc::group_output_xonly(&group_pub)?;
+
+                let (access_log, attempt) =
+                    audit_preflight(horcrux::btc_mpc::shard_ids(&shares)?, log_file, force)?;
+
+                let recipient_str = recipient.to_string();
+                let params = horcrux::bitcoin::BitcoinParams {
+                    utxos,
+                    recipient,
+                    amount_sat,
+                    change_address,
+                    fee_sat,
+                };
+                let sighash = horcrux::bitcoin::unsigned_sighash(&output_xonly, &params)?;
+                let sig = horcrux::btc_mpc::btc_mpc_sign_with_audit(
+                    &shares,
+                    &passwords,
+                    &group_pub,
+                    &sighash,
+                    &access_log,
+                    attempt,
+                )?;
+                let signed = horcrux::bitcoin::assemble_signed_transaction(
+                    sig.output_xonly,
+                    params,
+                    sig.signature,
+                )?;
+                println!("From:      {}", signed.sender());
+                println!("Recipient: {recipient_str}");
+                println!("Txid:      {}", signed.txid());
+                println!("Fee:       {} sat", signed.fee_sat());
+                println!("Change:    {} sat", signed.change_sat());
+                println!("Signature: {}", hex::encode(signed.signature()));
+                println!("Raw:       {}", signed.raw_hex());
+
+                if broadcast {
+                    let rpc_url = rpc_url.unwrap_or_else(horcrux::bitcoin::default_rpc_url);
+                    println!("Broadcasting via {rpc_url}");
+                    let txid = horcrux::bitcoin::broadcast(
+                        &rpc_url,
+                        rpc_user.as_deref(),
+                        rpc_password.as_deref(),
+                        signed.tx(),
+                    )?;
+                    println!("Mined:     {txid} (accepted by mempool)");
+                }
+                return Ok(());
+            }
+
             let to: solana_pubkey::Pubkey = to
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid --to address: {e}"))?;
+            let lamports = lamports
+                .ok_or_else(|| anyhow::anyhow!("--lamports is required for the solana chain"))?;
 
             let rpc_url = rpc_url.unwrap_or_else(horcrux::chain::default_rpc_url);
             let chain = if broadcast {
@@ -694,6 +978,295 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Command::QrRequest {
+            group_dir,
+            to,
+            lamports,
+            blockhash,
+            dir,
+            format,
+        } => {
+            let to: solana_pubkey::Pubkey = to
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid --to address: {e}"))?;
+            let blockhash: solana_hash::Hash = blockhash
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid --blockhash: {e}"))?;
+
+            let group_pub_path = group_dir.join(horcrux::mpc::GROUP_PUB_FILENAME);
+            let group_pub_bytes = std::fs::read(&group_pub_path)
+                .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", group_pub_path.display()))?;
+            let verifying_key = horcrux::mpc::group_verifying_key(&group_pub_path)?;
+            let from = solana_pubkey::Pubkey::from(verifying_key);
+
+            let params = TxParams {
+                from,
+                to,
+                lamports,
+                blockhash,
+            };
+            let message = horcrux::tx::transaction_message(&params);
+            let message_bytes = message.serialize();
+
+            let request = horcrux::qr_mpc::mpc_sign_request(&group_pub_bytes, &message_bytes)?;
+            let paths = horcrux::qr::write_message_transport(
+                &dir,
+                "request",
+                format.into(),
+                horcrux::qr::MessageType::Request,
+                request.session,
+                &request.to_payload(),
+            )?;
+            println!("Signing request: {from} -> {to} ({lamports} lamports)");
+            println!("Session: {}", hex::encode(request.session));
+            for p in &paths {
+                println!("  {}", p.display());
+            }
+            println!(
+                "Carry these file(s) across the air gap to each guardian, then run `horcrux qr-commit`."
+            );
+        }
+        Command::QrCommit {
+            share,
+            password,
+            dir,
+            nonce_file,
+            format,
+            log_file,
+            force,
+        } => {
+            let password = match password {
+                Some(pw) => pw,
+                None => rpassword::prompt_password(format!("Password for {}: ", share.display()))?,
+            };
+
+            let (msg_type, session, payload) =
+                horcrux::qr::read_message_transport(&dir, "request")?;
+            if msg_type != horcrux::qr::MessageType::Request {
+                anyhow::bail!("expected a signing request in {}", dir.display());
+            }
+            let request = horcrux::qr_mpc::RequestData::from_payload(session, &payload)?;
+
+            let share_id = horcrux::mpc::FrostShare::read(&share)?.id;
+            let (access_log, attempt) = audit_preflight(vec![share_id], log_file, force)?;
+            let ts = horcrux::audit::now_ms();
+            let participant =
+                horcrux::qr_mpc::load_participant(&request, &share, &password, |id, ok| {
+                    let entry = if ok {
+                        horcrux::audit::Entry::ok(ts, attempt, id)
+                    } else {
+                        horcrux::audit::Entry::fail(ts, attempt, id)
+                    };
+                    let _ = access_log.append(&entry);
+                })?;
+
+            let mut rng = rand::rngs::OsRng;
+            let (commitment, nonces) =
+                horcrux::qr_mpc::produce_commitment(&participant.key_package, &mut rng)?;
+
+            let nonce_path = nonce_file.unwrap_or_else(|| default_nonce_path(&share));
+            horcrux::qr_mpc::save_nonces(&nonce_path, &password, &session, &nonces)?;
+
+            let prefix = format!("commit-{}", commitment.participant_id);
+            let paths = horcrux::qr::write_message_transport(
+                &dir,
+                &prefix,
+                format.into(),
+                horcrux::qr::MessageType::Commitment,
+                session,
+                &commitment.to_payload(),
+            )?;
+            println!("Committed as participant {}", commitment.participant_id);
+            for p in &paths {
+                println!("  {}", p.display());
+            }
+            println!(
+                "Nonces kept locally at {} until `qr-share` runs; do not copy this file across the air gap.",
+                nonce_path.display()
+            );
+        }
+        Command::QrPackage { dir, format } => {
+            let (msg_type, session, payload) =
+                horcrux::qr::read_message_transport(&dir, "request")?;
+            if msg_type != horcrux::qr::MessageType::Request {
+                anyhow::bail!("expected a signing request in {}", dir.display());
+            }
+            let request = horcrux::qr_mpc::RequestData::from_payload(session, &payload)?;
+
+            let ids = horcrux::qr::list_participant_ids(&dir, "commit")?;
+            if ids.is_empty() {
+                anyhow::bail!("no commitments found in {}", dir.display());
+            }
+            let mut commitments = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let prefix = format!("commit-{id}");
+                let (t, s, payload) = horcrux::qr::read_message_transport(&dir, &prefix)?;
+                if t != horcrux::qr::MessageType::Commitment || s != session {
+                    anyhow::bail!("{prefix} does not belong to this signing session");
+                }
+                commitments.push(horcrux::qr_mpc::CommitmentData::from_payload(&payload)?);
+            }
+
+            let package_bytes = horcrux::qr_mpc::mpc_sign_package(&request, &commitments)?;
+            let paths = horcrux::qr::write_message_transport(
+                &dir,
+                "package",
+                format.into(),
+                horcrux::qr::MessageType::SigningPackage,
+                session,
+                &package_bytes,
+            )?;
+            println!(
+                "Signing package built from {} commitment(s): {ids:?}",
+                ids.len()
+            );
+            for p in &paths {
+                println!("  {}", p.display());
+            }
+        }
+        Command::QrShare {
+            share,
+            password,
+            dir,
+            nonce_file,
+            format,
+            log_file,
+            force,
+        } => {
+            let password = match password {
+                Some(pw) => pw,
+                None => rpassword::prompt_password(format!("Password for {}: ", share.display()))?,
+            };
+
+            let (msg_type, session, payload) =
+                horcrux::qr::read_message_transport(&dir, "request")?;
+            if msg_type != horcrux::qr::MessageType::Request {
+                anyhow::bail!("expected a signing request in {}", dir.display());
+            }
+            let request = horcrux::qr_mpc::RequestData::from_payload(session, &payload)?;
+
+            let (pkg_type, pkg_session, package_bytes) =
+                horcrux::qr::read_message_transport(&dir, "package")?;
+            if pkg_type != horcrux::qr::MessageType::SigningPackage || pkg_session != session {
+                anyhow::bail!(
+                    "signing package in {} does not match this request",
+                    dir.display()
+                );
+            }
+
+            let share_id = horcrux::mpc::FrostShare::read(&share)?.id;
+            let (access_log, attempt) = audit_preflight(vec![share_id], log_file, force)?;
+            let ts = horcrux::audit::now_ms();
+            let participant =
+                horcrux::qr_mpc::load_participant(&request, &share, &password, |id, ok| {
+                    let entry = if ok {
+                        horcrux::audit::Entry::ok(ts, attempt, id)
+                    } else {
+                        horcrux::audit::Entry::fail(ts, attempt, id)
+                    };
+                    let _ = access_log.append(&entry);
+                })?;
+
+            let nonce_path = nonce_file.unwrap_or_else(|| default_nonce_path(&share));
+            let nonces = horcrux::qr_mpc::load_nonces(&nonce_path, &password, &session)?;
+
+            let sig_share = horcrux::qr_mpc::produce_signature_share(
+                &request,
+                &package_bytes,
+                &participant.key_package,
+                nonces,
+            )?;
+            // Nonces are single-use; remove the local file once consumed
+            // (best-effort — a leftover file is inert without the password,
+            // but must never be reused for another signature).
+            let _ = std::fs::remove_file(&nonce_path);
+            let _ = access_log.append(&horcrux::audit::Entry::signed(
+                horcrux::audit::now_ms(),
+                attempt,
+            ));
+
+            let prefix = format!("share-{}", sig_share.participant_id);
+            let paths = horcrux::qr::write_message_transport(
+                &dir,
+                &prefix,
+                format.into(),
+                horcrux::qr::MessageType::SignatureShare,
+                session,
+                &sig_share.to_payload(),
+            )?;
+            println!(
+                "Signature share produced for participant {}",
+                sig_share.participant_id
+            );
+            for p in &paths {
+                println!("  {}", p.display());
+            }
+        }
+        Command::QrFinalize {
+            dir,
+            rpc_url,
+            broadcast,
+            log_file: _,
+        } => {
+            let (msg_type, session, req_payload) =
+                horcrux::qr::read_message_transport(&dir, "request")?;
+            if msg_type != horcrux::qr::MessageType::Request {
+                anyhow::bail!("expected a signing request in {}", dir.display());
+            }
+            let request = horcrux::qr_mpc::RequestData::from_payload(session, &req_payload)?;
+
+            let (pkg_type, pkg_session, package_bytes) =
+                horcrux::qr::read_message_transport(&dir, "package")?;
+            if pkg_type != horcrux::qr::MessageType::SigningPackage || pkg_session != session {
+                anyhow::bail!(
+                    "signing package in {} does not match this request",
+                    dir.display()
+                );
+            }
+
+            let ids = horcrux::qr::list_participant_ids(&dir, "share")?;
+            if ids.is_empty() {
+                anyhow::bail!("no signature shares found in {}", dir.display());
+            }
+            let mut shares = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let prefix = format!("share-{id}");
+                let (t, s, payload) = horcrux::qr::read_message_transport(&dir, &prefix)?;
+                if t != horcrux::qr::MessageType::SignatureShare || s != session {
+                    anyhow::bail!("{prefix} does not belong to this signing session");
+                }
+                shares.push(horcrux::qr_mpc::SignatureShareData::from_payload(&payload)?);
+            }
+
+            let sig =
+                horcrux::qr_mpc::finalize_signature(&package_bytes, &shares, &request.group_pub)?;
+
+            let message: solana_message::Message = bincode::deserialize(&request.message)
+                .map_err(|e| anyhow::anyhow!("failed to decode the signed message: {e}"))?;
+            let signed = horcrux::tx::assemble_signed_transaction(
+                message,
+                sig.signature,
+                sig.verifying_key,
+            )?;
+
+            println!("From:      {}", signed.from());
+            println!("Signature: {}", signed.signature());
+            println!("Raw:       {}", signed.raw_base58());
+
+            if broadcast {
+                let rpc_url = rpc_url.unwrap_or_else(horcrux::chain::default_rpc_url);
+                println!("Broadcasting via {rpc_url}");
+                let chain = horcrux::chain::Chain::connect(&rpc_url);
+                let signature = horcrux::chain::broadcast(
+                    chain.client(),
+                    signed.tx(),
+                    std::time::Duration::from_secs(1),
+                    60,
+                )
+                .await?;
+                println!("Mined:     {signature} (confirmed)");
+            }
+        }
         Command::Verify { files, password } => {
             use horcrux::verify::{Kind, consistency_error, verify_files};
 
@@ -775,6 +1348,15 @@ fn audit_preflight(
 fn access_log_path(flag: Option<PathBuf>) -> PathBuf {
     flag.or_else(|| std::env::var_os("HORCRUX_ACCESS_LOG").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("horcrux-access.log"))
+}
+
+/// Default location for a `qr-commit`/`qr-share` participant's local nonce
+/// state: next to the share file, never inside the `--dir` that crosses the
+/// air gap.
+fn default_nonce_path(share: &std::path::Path) -> PathBuf {
+    let mut name = share.as_os_str().to_owned();
+    name.push(".qr-nonce");
+    PathBuf::from(name)
 }
 
 /// Parse a hex-encoded secp256k1 private key (32 bytes), tolerating a 0x

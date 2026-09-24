@@ -146,6 +146,35 @@ impl SignedBitcoinTx {
     }
 }
 
+/// Default Bitcoin Core RPC endpoint (regtest), overridden by `--rpc-url` or
+/// `$HORCRUX_BTC_RPC_URL`.
+pub fn default_rpc_url() -> String {
+    std::env::var("HORCRUX_BTC_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:18443".to_string())
+}
+
+/// Broadcast a signed transaction to a Bitcoin Core node via
+/// `sendrawtransaction`. `rpc_user`/`rpc_password` authenticate over RPC
+/// basic auth when the node requires it (unauthenticated `Auth::None`
+/// otherwise, e.g. a local regtest node with no `-rpcauth`).
+pub fn broadcast(
+    rpc_url: &str,
+    rpc_user: Option<&str>,
+    rpc_password: Option<&str>,
+    tx: &Transaction,
+) -> Result<bitcoin::Txid, Error> {
+    use bitcoincore_rpc::{Auth, Client, RpcApi};
+
+    let auth = match (rpc_user, rpc_password) {
+        (Some(user), Some(password)) => Auth::UserPass(user.to_string(), password.to_string()),
+        _ => Auth::None,
+    };
+    let client = Client::new(rpc_url, auth)
+        .map_err(|e| Error::Bitcoin(format!("failed to connect to {rpc_url}: {e}")))?;
+    client
+        .send_raw_transaction(tx)
+        .map_err(|e| Error::Bitcoin(format!("broadcast failed: {e}")))
+}
+
 /// Parse a mainnet bech32 Bitcoin address, rejecting any other network.
 pub fn parse_address(s: &str) -> Result<Address, Error> {
     let unchecked: bitcoin::address::Address<bitcoin::address::NetworkUnchecked> = s
@@ -199,16 +228,15 @@ fn p2tr_address(output_xonly: &[u8; 32]) -> Address {
     )
 }
 
-/// Sign a Bitcoin Taproot transfer for `seed` entirely offline.
-///
-/// All inputs are spent via the sender's own P2TR output key with a single
-/// key-path signature (`SIGHASH_DEFAULT`, so no sighash byte is appended).
-/// A change output is added only when `inputs - amount - fee > 0`.
-/// The seed is consumed and zeroized before returning.
-pub fn sign_transaction(
-    mut seed: [u8; 32],
-    params: BitcoinParams,
-) -> Result<SignedBitcoinTx, Error> {
+/// Build the unsigned transaction and BIP341 key-path sighash for a transfer
+/// from `output_xonly`'s P2TR address. Pure public computation: no signing
+/// key is needed, only the (already-derived) output key, so this is shared by
+/// both Mode A ([`sign_transaction`]) and Mode B
+/// ([`crate::btc_mpc::btc_mpc_sign`], via [`assemble_signed_transaction`]).
+fn build_unsigned(
+    output_xonly: &[u8; 32],
+    params: &BitcoinParams,
+) -> Result<(Address, Transaction, [u8; 32], u64), Error> {
     if params.utxos.is_empty() {
         return Err(Error::Bitcoin("at least one --utxo is required".into()));
     }
@@ -216,8 +244,7 @@ pub fn sign_transaction(
         return Err(Error::Bitcoin("--amount-sat must be positive".into()));
     }
 
-    let keys = taproot_keys(&seed)?;
-    let sender = p2tr_address(&keys.output_xonly);
+    let sender = p2tr_address(output_xonly);
 
     let total_in = params.utxos.iter().try_fold(0u64, |acc, u| {
         acc.checked_add(u.value_sat)
@@ -228,7 +255,6 @@ pub fn sign_transaction(
         .checked_add(params.fee_sat)
         .ok_or_else(|| Error::Bitcoin("amount + fee overflow u64".into()))?;
     if total_in < total_out {
-        seed.zeroize();
         return Err(Error::Bitcoin(format!(
             "inputs ({total_in} sat) do not cover amount ({}) + fee ({} sat)",
             params.amount_sat, params.fee_sat
@@ -253,7 +279,7 @@ pub fn sign_transaction(
         });
     }
 
-    let mut tx = Transaction {
+    let tx = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
         input: params
@@ -284,19 +310,26 @@ pub fn sign_transaction(
         .map_err(|e| Error::Bitcoin(format!("failed to compute taproot sighash: {e}")))?;
     let sighash_bytes: [u8; 32] = sighash.to_byte_array();
 
-    let sig = keys
-        .signing_key
-        .sign_prehash(&sighash_bytes)
-        .map_err(|e| Error::Bitcoin(format!("BIP340 signing failed: {e}")))?;
-    let sig_bytes: [u8; 64] = sig.to_bytes();
+    Ok((sender, tx, sighash_bytes, change_sat))
+}
 
-    if keys
-        .signing_key
-        .verifying_key()
-        .verify_prehash(&sighash_bytes, &sig)
-        .is_err()
-    {
-        seed.zeroize();
+/// Attach a key-path witness to every input and re-verify the BIP340
+/// signature against the sighash before returning. Shared tail end of both
+/// signing modes.
+fn finish_signed(
+    sender: Address,
+    output_xonly: [u8; 32],
+    mut tx: Transaction,
+    sighash_bytes: [u8; 32],
+    sig_bytes: [u8; 64],
+    fee_sat: u64,
+    change_sat: u64,
+) -> Result<SignedBitcoinTx, Error> {
+    let vk = k256::schnorr::VerifyingKey::from_bytes(&output_xonly)
+        .map_err(|e| Error::Bitcoin(format!("invalid output key: {e}")))?;
+    let sig = k256::schnorr::Signature::try_from(&sig_bytes[..])
+        .map_err(|e| Error::Bitcoin(format!("invalid signature encoding: {e}")))?;
+    if vk.verify_prehash(&sighash_bytes, &sig).is_err() {
         return Err(Error::Bitcoin(
             "BIP340 signature failed local verification".into(),
         ));
@@ -311,17 +344,92 @@ pub fn sign_transaction(
         input.witness = witness.clone();
     }
 
-    seed.zeroize();
-
     Ok(SignedBitcoinTx {
         sender,
-        output_xonly: keys.output_xonly,
+        output_xonly,
         tx,
         signature: sig_bytes,
         sighash: sighash_bytes,
-        fee_sat: params.fee_sat,
+        fee_sat,
         change_sat,
     })
+}
+
+/// Sign a Bitcoin Taproot transfer for `seed` entirely offline (Mode A).
+///
+/// All inputs are spent via the sender's own P2TR output key with a single
+/// key-path signature (`SIGHASH_DEFAULT`, so no sighash byte is appended).
+/// A change output is added only when `inputs - amount - fee > 0`.
+/// The seed is consumed and zeroized before returning.
+pub fn sign_transaction(
+    mut seed: [u8; 32],
+    params: BitcoinParams,
+) -> Result<SignedBitcoinTx, Error> {
+    let keys = taproot_keys(&seed)?;
+    let (sender, tx, sighash_bytes, change_sat) = match build_unsigned(&keys.output_xonly, &params)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            seed.zeroize();
+            return Err(e);
+        }
+    };
+
+    let sig = match keys.signing_key.sign_prehash(&sighash_bytes) {
+        Ok(sig) => sig,
+        Err(e) => {
+            seed.zeroize();
+            return Err(Error::Bitcoin(format!("BIP340 signing failed: {e}")));
+        }
+    };
+    let sig_bytes: [u8; 64] = sig.to_bytes();
+    seed.zeroize();
+
+    finish_signed(
+        sender,
+        keys.output_xonly,
+        tx,
+        sighash_bytes,
+        sig_bytes,
+        params.fee_sat,
+        change_sat,
+    )
+}
+
+/// Assemble a signed Bitcoin transaction from an externally produced BIP340
+/// signature (e.g. a FROST-aggregated signature from
+/// [`crate::btc_mpc::btc_mpc_sign`]) and the group's tweaked output key.
+///
+/// The signature is verified against the recomputed sighash before the
+/// transaction is returned, so an invalid aggregate can never yield a
+/// broadcastable transaction.
+pub fn assemble_signed_transaction(
+    output_xonly: [u8; 32],
+    params: BitcoinParams,
+    signature: [u8; 64],
+) -> Result<SignedBitcoinTx, Error> {
+    let (sender, tx, sighash_bytes, change_sat) = build_unsigned(&output_xonly, &params)?;
+    finish_signed(
+        sender,
+        output_xonly,
+        tx,
+        sighash_bytes,
+        signature,
+        params.fee_sat,
+        change_sat,
+    )
+}
+
+/// Compute the BIP341 key-path sighash for a transfer from `output_xonly`'s
+/// P2TR address, without building the rest of the signed transaction. Used by
+/// Mode B to get the exact bytes the FROST group must sign, before any
+/// signature exists.
+pub fn unsigned_sighash(
+    output_xonly: &[u8; 32],
+    params: &BitcoinParams,
+) -> Result<[u8; 32], Error> {
+    let (_, _, sighash, _) = build_unsigned(output_xonly, params)?;
+    Ok(sighash)
 }
 
 #[cfg(test)]
