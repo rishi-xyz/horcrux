@@ -85,6 +85,7 @@ N=3
 PW="guardian-demo-password"
 OUT="$(mktemp -d)"
 broadcast_ran=0
+btc_broadcast_ran=0
 # Any command without an explicit --log-file writes to the demo's temp dir
 # instead of polluting the repository root.
 export HORCRUX_ACCESS_LOG="$OUT/access.log"
@@ -302,9 +303,10 @@ export HORCRUX_ACCESS_LOG="$OUT/mode-b.log"
 
 # --- 12. optional test suite ------------------------------------------
 step 12 "full test suite (optional)"
-info "cargo test runs 66 unit tests (sss, crypto, shard, chain, audit, tx, mpc,"
-info "verify, lib) plus integration suites: tests/roundtrip.rs, tests/sign.rs,"
-info "tests/audit.rs, tests/mpc.rs, tests/verify.rs."
+info "cargo test runs 96 unit tests (sss, crypto, shard, chain, audit, tx, mpc,"
+info "btc_mpc, bitcoin, cosmos, qr, qr_mpc, verify, lib) plus integration suites:"
+info "tests/roundtrip.rs, tests/sign.rs, tests/audit.rs, tests/mpc.rs,"
+info "tests/btc_mpc.rs, tests/qr.rs, tests/verify.rs."
 run_tests=0
 if [[ "$AUTO" == 1 ]]; then
     run_tests=1
@@ -430,6 +432,141 @@ fi
 ok "structure + auth-tag verification works for HX1 shards and HX2 shares"
 pause
 
+# --- 14b. air-gapped QR Mode B -------------------------------------------
+step 14b "Mode B over the air gap -- real QR-code PNGs, no shared process"
+info "qr-request/-commit/-package/-share/-finalize (src/qr.rs, src/qr_mpc.rs) run"
+info "the same FROST protocol as mpc-sign, but every message crosses as a real"
+info "scannable QR-code PNG file under --dir instead of an in-process call."
+info "Round-1 nonces are kept encrypted next to each share file (never in --dir)"
+info "and deleted once round 2 consumes them."
+QRDIR="$OUT/qr"
+show "$BIN" qr-request --group-dir "$OUT/mpc" --to "$TO" --lamports 1 \
+    --blockhash "$BH" --dir "$QRDIR"
+"$BIN" qr-request --group-dir "$OUT/mpc" --to "$TO" --lamports 1 \
+    --blockhash "$BH" --dir "$QRDIR"
+show "$BIN" qr-commit "$OUT/mpc/mpc-1.hx" --password "$PW" --dir "$QRDIR"
+"$BIN" qr-commit "$OUT/mpc/mpc-1.hx" --password "$PW" --dir "$QRDIR"
+show "$BIN" qr-commit "$OUT/mpc/mpc-2.hx" --password "$PW" --dir "$QRDIR"
+"$BIN" qr-commit "$OUT/mpc/mpc-2.hx" --password "$PW" --dir "$QRDIR"
+show "$BIN" qr-package --dir "$QRDIR"
+"$BIN" qr-package --dir "$QRDIR"
+show "$BIN" qr-share "$OUT/mpc/mpc-1.hx" --password "$PW" --dir "$QRDIR"
+"$BIN" qr-share "$OUT/mpc/mpc-1.hx" --password "$PW" --dir "$QRDIR"
+show "$BIN" qr-share "$OUT/mpc/mpc-2.hx" --password "$PW" --dir "$QRDIR"
+"$BIN" qr-share "$OUT/mpc/mpc-2.hx" --password "$PW" --dir "$QRDIR"
+show "$BIN" qr-finalize --dir "$QRDIR"
+QR_FINAL="$("$BIN" qr-finalize --dir "$QRDIR")"
+printf '%s\n' "$QR_FINAL"
+QR_FROM="$(printf '%s\n' "$QR_FINAL" | sed -n 's/^From:      //p')"
+if [[ -n "$MPC_FROM" && "$QR_FROM" == "$MPC_FROM" ]]; then
+    ok "air-gapped QR signature recovers the same sender as in-process Mode B"
+else
+    fail "QR-transported signature derived a different sender"
+    exit 1
+fi
+if [[ -f "$QRDIR/request-0.png" && -f "$QRDIR/package-0.png" ]]; then
+    ok "every protocol message is a real PNG QR code on disk: $(ls "$QRDIR"/*.png | wc -l | tr -d ' ') files"
+else
+    fail "expected QR PNG files were not written"
+    exit 1
+fi
+pause
+
+# --- 14c. Bitcoin Taproot signing (Mode A + Mode B) ----------------------
+step 14c "Bitcoin Taproot -- Mode A and Mode B (FROST over secp256k1-tr)"
+info "sign --chain bitcoin (Mode A) and mpc-split/mpc-sign --chain bitcoin (Mode B,"
+info "src/btc_mpc.rs, frost-secp256k1-tr) both derive a BIP341 P2TR address from"
+info "the same seed and produce a BIP340 Schnorr signature. This is offline key-path"
+info "signing against a synthetic UTXO -- no funds move; see step 14d for a real"
+info "regtest broadcast when bitcoind is available."
+BTC_TO="bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"
+BTC_UTXO="0000000000000000000000000000000000000000000000000000000000000001:0:100000"
+show "$BIN" sign "$OUT/shard-1.hx" "$OUT/shard-2.hx" --chain bitcoin --password "$PW" \
+    --to "$BTC_TO" --utxo "$BTC_UTXO" --amount-sat 60000 --fee-sat 10000
+BTC_A="$("$BIN" sign "$OUT/shard-1.hx" "$OUT/shard-2.hx" --chain bitcoin --password "$PW" \
+    --to "$BTC_TO" --utxo "$BTC_UTXO" --amount-sat 60000 --fee-sat 10000)"
+printf '%s\n' "$BTC_A"
+BTC_A_FROM="$(printf '%s\n' "$BTC_A" | sed -n 's/^From:      //p')"
+ok "Mode A: offline Taproot transfer signed and locally verified"
+
+show "$BIN" mpc-split --chain bitcoin --key-hex "0x$KEY" --threshold "$T" --shares "$N" \
+    --out-dir "$OUT/btc-mpc" --password "$PW"
+"$BIN" mpc-split --chain bitcoin --key-hex "0x$KEY" --threshold "$T" --shares "$N" \
+    --out-dir "$OUT/btc-mpc" --password "$PW"
+show "$BIN" mpc-sign "$OUT/btc-mpc/btc-mpc-1.hx" "$OUT/btc-mpc/btc-mpc-2.hx" \
+    --chain bitcoin --group-dir "$OUT/btc-mpc" --password "$PW" \
+    --to "$BTC_TO" --utxo "$BTC_UTXO" --amount-sat 60000 --fee-sat 10000
+BTC_B="$("$BIN" mpc-sign "$OUT/btc-mpc/btc-mpc-1.hx" "$OUT/btc-mpc/btc-mpc-2.hx" \
+    --chain bitcoin --group-dir "$OUT/btc-mpc" --password "$PW" \
+    --to "$BTC_TO" --utxo "$BTC_UTXO" --amount-sat 60000 --fee-sat 10000)"
+printf '%s\n' "$BTC_B"
+BTC_B_FROM="$(printf '%s\n' "$BTC_B" | sed -n 's/^From:      //p')"
+if [[ -n "$BTC_A_FROM" && "$BTC_A_FROM" == "$BTC_B_FROM" ]]; then
+    ok "Bitcoin Mode A and Mode B (FROST) derive the same P2TR address: $BTC_A_FROM"
+else
+    fail "Bitcoin Mode A and Mode B sender addresses differ"
+    exit 1
+fi
+pause
+
+# --- 14d. optional live Bitcoin regtest broadcast -------------------------
+step 14d "live broadcast to a Bitcoin Core regtest node (optional)"
+if ! command -v bitcoind >/dev/null 2>&1 || ! command -v bitcoin-cli >/dev/null 2>&1; then
+    warn "bitcoind/bitcoin-cli not found -- skipping live Bitcoin broadcast"
+    warn "install Bitcoin Core, then re-run ./demo.sh to see this confirmed on regtest"
+else
+    BTC_DATADIR="$OUT/bitcoind"
+    mkdir -p "$BTC_DATADIR"
+    info "Starting a fresh regtest node, mining coins to a wallet address, then"
+    info "signing a real spend from that wallet's UTXO with the horcrux-derived key."
+    bitcoind -regtest -datadir="$BTC_DATADIR" -daemon -fallbackfee=0.0001 \
+        -rpcuser=horcrux -rpcpassword=horcrux-demo >"$OUT/bitcoind.log" 2>&1
+    BTC_CLI=(bitcoin-cli -regtest -datadir="$BTC_DATADIR" -rpcuser=horcrux -rpcpassword=horcrux-demo)
+    info "waiting for regtest RPC ..."
+    ready=0
+    for _ in $(seq 1 30); do
+        if "${BTC_CLI[@]}" getblockchaininfo >/dev/null 2>&1; then ready=1; break; fi
+        sleep 1
+    done
+    if [[ "$ready" != 1 ]]; then
+        fail "bitcoind did not become ready -- see $OUT/bitcoind.log"
+        exit 1
+    fi
+    "${BTC_CLI[@]}" createwallet demo >/dev/null
+    FUND_ADDR="$("${BTC_CLI[@]}" getnewaddress "" bech32)"
+    "${BTC_CLI[@]}" generatetoaddress 101 "$FUND_ADDR" >/dev/null
+    ok "regtest ready, wallet funded with 101 blocks"
+
+    "${BTC_CLI[@]}" sendtoaddress "$BTC_A_FROM" 0.001 >/dev/null
+    "${BTC_CLI[@]}" generatetoaddress 1 "$FUND_ADDR" >/dev/null
+    UTXO_JSON="$("${BTC_CLI[@]}" listunspent 1 9999999 "[\"$BTC_A_FROM\"]")"
+    UTXO_TXID="$(printf '%s' "$UTXO_JSON" | sed -n 's/.*"txid": "\([^"]*\)".*/\1/p' | head -1)"
+    UTXO_VOUT="$(printf '%s' "$UTXO_JSON" | sed -n 's/.*"vout": \([0-9]*\).*/\1/p' | head -1)"
+    UTXO_SAT=100000
+    ok "sender funded: $BTC_A_FROM ($UTXO_TXID:$UTXO_VOUT)"
+
+    show "$BIN" sign "$OUT/shard-1.hx" "$OUT/shard-2.hx" --chain bitcoin --password "$PW" \
+        --to "$BTC_TO" --utxo "$UTXO_TXID:$UTXO_VOUT:$UTXO_SAT" \
+        --amount-sat 50000 --fee-sat 10000 --broadcast \
+        --rpc-url "http://127.0.0.1:18443" --rpc-user horcrux --rpc-password horcrux-demo
+    BTC_LIVE="$("$BIN" sign "$OUT/shard-1.hx" "$OUT/shard-2.hx" --chain bitcoin --password "$PW" \
+        --to "$BTC_TO" --utxo "$UTXO_TXID:$UTXO_VOUT:$UTXO_SAT" \
+        --amount-sat 50000 --fee-sat 10000 --broadcast \
+        --rpc-url "http://127.0.0.1:18443" --rpc-user horcrux --rpc-password horcrux-demo)"
+    printf '%s\n' "$BTC_LIVE"
+    if printf '%s\n' "$BTC_LIVE" | grep -q "^Mined:"; then
+        ok "Bitcoin transfer accepted by the regtest mempool"
+        btc_broadcast_ran=1
+    else
+        fail "Bitcoin broadcast did not confirm"
+        exit 1
+    fi
+
+    "${BTC_CLI[@]}" stop >/dev/null 2>&1 || true
+    ok "regtest node stopped"
+fi
+pause
+
 # --- 15. optional live broadcast ---------------------------------------
 step 15 "live broadcast to solana-test-validator (optional)"
 if ! command -v solana-test-validator >/dev/null 2>&1; then
@@ -524,16 +661,26 @@ ok "mpc:         2-of-3 FROST key shares sign without reconstructing the key"
 ok "mpc:         same sender address as Mode A; signatures non-deterministic"
 ok "mpc:         rejected: too few participants / Mode A shard as FROST share"
 ok "verify:      structural + auth-tag integrity checks (HX1 and HX2)"
+ok "qr:          air-gapped Mode B over real QR-code PNGs; same sender as in-process Mode B"
+ok "bitcoin:     Taproot Mode A and Mode B (FROST/secp256k1-tr) agree on one P2TR address"
+if [[ "$btc_broadcast_ran" == 1 ]]; then
+    ok "btc broadcast: transfer accepted by a local bitcoind regtest node"
+else
+    warn "btc broadcast: skipped (bitcoind/bitcoin-cli not installed)"
+fi
 if [[ "$broadcast_ran" == 1 ]]; then
     ok "broadcast:   Mode A and Mode B transfers confirmed on solana-test-validator"
 else
     warn "broadcast:   skipped (solana-test-validator not installed)"
 fi
+warn "cosmos:      sign --chain cosmos --broadcast is implemented but needs a live"
+warn "             gaiad/simd node, so it isn't exercised by this script -- see README"
 if [[ "$run_tests" == 1 ]]; then
-    ok "tests:      66 unit + 8 roundtrip + 3 sign + 4 audit + 7 mpc + 3 verify tests green"
+    ok "tests:      96 unit + 8 roundtrip + 3 sign + 4 audit + 7 mpc + 3 btc_mpc + 2 qr + 3 verify tests green"
 fi
 printf '%s\n' "---"
 info "Phases 1-4 are done end to end: init, reconstruct, offline sign + broadcast"
 info "to the local validator, audit/anomaly detection, Mode B FROST threshold"
-info "signing where the key never exists on any machine, and passive verify."
+info "signing where the key never exists on any machine, passive verify, an"
+info "air-gapped QR transport for Mode B, and Bitcoin Taproot support in both modes."
 info "Phase 5 hardens the CLI surface (verify) and rehearses the full demo."

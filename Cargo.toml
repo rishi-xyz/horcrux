@@ -11,11 +11,13 @@ anyhow = "1"
 argon2 = "0.5"
 bincode = "1"
 bitcoin = { version = "0.32", default-features = false, features = ["std"] }
+bitcoincore-rpc = "0.19.0"
 bs58 = "0.5"
 clap = { version = "4.6", features = ["derive"] }
-cosmrs = { version = "0.22", default-features = false }
+cosmrs = { version = "0.22", default-features = false, features = ["rpc", "tokio"] }
 ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] }
 frost-ed25519 = "3.0.0"
+frost-secp256k1-tr = "3.0.0"
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 k256 = { version = "0.13", features = ["schnorr"] }

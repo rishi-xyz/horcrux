@@ -8,6 +8,7 @@
 
 pub mod audit;
 pub mod bitcoin;
+pub mod btc_mpc;
 pub mod chain;
 pub mod cosmos;
 pub mod crypto;
@@ -271,6 +272,27 @@ pub fn sign_bitcoin_transaction_from_shards(
 ) -> Result<bitcoin::SignedBitcoinTx, Error> {
     let key = reconstruct(shard_paths, passwords)?;
     bitcoin::sign_transaction(*key_seed(&key), params)
+}
+
+/// Sign a Bitcoin Taproot transfer with a threshold FROST subset of Bitcoin
+/// share files (Mode B), without ever reconstructing the signing key.
+///
+/// The FROST group's tweaked output key equals the Mode A P2TR address for
+/// the same seed, so the resulting transaction is indistinguishable from one
+/// signed with the full key.
+pub fn sign_bitcoin_transaction_from_mpc_shares(
+    share_paths: &[PathBuf],
+    passwords: &[String],
+    group_pub_path: &Path,
+    params: bitcoin::BitcoinParams,
+) -> Result<bitcoin::SignedBitcoinTx, Error> {
+    let output_xonly = btc_mpc::group_output_xonly(group_pub_path)?;
+    let sighash = bitcoin::unsigned_sighash(&output_xonly, &params)?;
+    let btc_mpc::BtcMpcSignature {
+        signature,
+        output_xonly,
+    } = btc_mpc::btc_mpc_sign(share_paths, passwords, group_pub_path, &sighash, |_, _| {})?;
+    bitcoin::assemble_signed_transaction(output_xonly, params, signature)
 }
 
 /// Reconstruct the key from shards and sign a Cosmos `bank.MsgSend` entirely

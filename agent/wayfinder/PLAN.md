@@ -237,6 +237,92 @@ major choice without hesitating.
 
 ---
 
+## Phase 7 — Bonus: Multi-Chain Signing, Bitcoin Mode B, & QR Air-Gapped Mode B (out-of-plan)
+
+**Not scoped by the original 8-week plan** — everything in this phase was explicitly
+listed under "Out of scope" in an earlier revision of this doc. A collaborator
+(`Ftabs305`) first added Bitcoin/Cosmos Mode A signing and a library-only QR/HX3
+protocol; that work was then completed (CLI wiring, tests, Bitcoin Mode B, broadcast
+support) so the plan matches what `main` actually claims. The report should note this
+phase as an extension beyond the original objectives, not a core deliverable — Mode A
+(Phase 2) and Solana Mode B (Phase 4) alone already satisfy the project's stated
+objectives.
+
+**Multi-chain Mode A signing (commit `834a082`, then extended) — done, wired,
+tested, with broadcast.** `horcrux sign --chain bitcoin|cosmos` (default `solana`)
+signs with the same reconstructed secp256k1/Ed25519 seed on two more chains
+(`src/bitcoin.rs`, `src/cosmos.rs`):
+- **Bitcoin:** offline Taproot (BIP340/341/342) key-path signing, as originally
+  shipped (tweaked P2TR output key via `H_taptweak(P)`, no script tree).
+  **Broadcast added:** `--broadcast` calls `sendrawtransaction` against a Bitcoin
+  Core node (`bitcoincore-rpc`, default `http://127.0.0.1:18443` — regtest —
+  override with `--rpc-url`/`$HORCRUX_BTC_RPC_URL`; `--rpc-user`/`--rpc-password`
+  for RPC auth).
+- **Cosmos:** offline `bank.MsgSend`/`SIGN_MODE_DIRECT` ECDSA signing, as
+  originally shipped. **Broadcast added:** `--broadcast` calls
+  `/broadcast_tx_commit` on a Tendermint RPC node (`cosmrs::rpc` /
+  `tendermint-rpc`, default `http://127.0.0.1:26657` — override with
+  `--rpc-url`/`$HORCRUX_COSMOS_RPC_URL`) and treats a non-OK `CheckTx`/delivery
+  result as an error rather than a silent "success".
+- Verified: unit tests for both modules, plus the full CLI path exercised live in
+  `demo.sh` (Bitcoin Mode A/B signing, and — when `bitcoind`/`bitcoin-cli` are
+  installed — a real regtest broadcast). **Not verified in this environment:**
+  neither `bitcoind` nor a Cosmos node (`gaiad`/`simd`) was available in the
+  sandbox this was built in, so Bitcoin broadcast was checked against
+  `cargo build`/unit tests only (the regtest `demo.sh` step is written and
+  gated exactly like the existing Solana step, but not run end-to-end here), and
+  Cosmos broadcast has no automated coverage at all beyond compiling — both are
+  worth a manual pass against a real node before relying on them.
+
+**Bitcoin Mode B (new, `src/btc_mpc.rs`) — done, wired, tested.**
+`horcrux mpc-split`/`mpc-sign --chain bitcoin` dealer-splits and threshold-signs
+using `frost-secp256k1-tr` (Zcash Foundation, same 3.0.0 lineage as
+`frost-ed25519`), mirroring `src/mpc.rs`'s architecture exactly: shares hold the
+*untweaked* internal FROST key, and the BIP341 tweak (no script tree) is applied
+at sign/aggregate time via the crate's own `round2::sign_with_tweak` /
+`aggregate_with_tweak` / `keys::Tweak` — never hand-rolled. Bitcoin FROST shares
+use their own `HX4` file magic and `group-btc.pub` filename (distinct from
+Solana's `HX2`/`group.pub` and the SSS `HX1`), so files from different
+chains/protocols can never be cross-used — asserted by a dedicated test.
+**Security property verified by test:** the Bitcoin Mode B group's tweaked P2TR
+address equals the Bitcoin Mode A address for the same seed
+(`btc_mpc::tests::frost_group_address_matches_mode_a_address`), exactly
+mirroring the existing Solana Mode A/B parity property. `--chain cosmos` is
+rejected on both `mpc-split` and `mpc-sign` with an explicit error: **Cosmos Mode
+B is out of scope, not merely unbuilt** — Cosmos uses plain ECDSA/secp256k1,
+which needs a fundamentally different threshold protocol (GG18/GG20/CGGMP21:
+multiplicative-to-additive share conversion, Paillier encryption, zero-knowledge
+proofs) than FROST/Schnorr, and no mature audited Rust crate for threshold ECDSA
+exists yet — per this plan's ground rule #1 ("don't implement cryptography from
+scratch, use audited crates only"), that makes it a deliberate boundary rather
+than missing work.
+
+**QR-based air-gapped Mode B (`src/qr.rs`, `src/qr_mpc.rs`) — done, wired,
+tested, with real QR images.** The HX3 frame protocol and FROST air-gap logic
+that shipped library-only now has:
+- **real QR-code PNG transport** (`qrcode` for encoding, `image` for PNG I/O,
+  `rqrr` for pure-Rust decoding) — `write_qr_png`/`read_qr_png` round-trip
+  correctly at the maximum single-frame payload (450 bytes), verified by test;
+- **five CLI subcommands** (`qr-request`, `qr-commit`, `qr-package`, `qr-share`,
+  `qr-finalize`) implementing the full 4-message protocol (request → commitment →
+  signing package → signature share → finalize) over files in a shared `--dir`
+  (`--format qr` for PNGs, `--format hx3` for a single frame-collection file);
+  round-1 nonces are kept in a small encrypted local file next to each share
+  (never written into `--dir`) between `qr-commit` and `qr-share`, and deleted
+  once consumed;
+- **tests**: 11 unit tests in `qr.rs` (frame/base58/multi-frame round trips, QR
+  PNG round trip at max payload, transport-format round trips, participant-id
+  scanning) and an integration test (`tests/qr.rs`) running the complete
+  protocol through real QR PNG files for every 2-of-3 participant combination,
+  asserting the aggregated signature verifies under plain Ed25519 and matches
+  the in-process Mode B sender address;
+- **`demo.sh` step 14b** runs the full five-command flow live and asserts the
+  QR-derived sender matches Mode B's in-process sender.
+- Scope note: QR Mode B remains Solana-only (it reuses `qr_mpc.rs`'s
+  `frost_ed25519` import); a Bitcoin QR flow was not attempted.
+
+---
+
 ## Not yet specified (resolve these as you go — don't block on them now)
 
 - Anomaly detection: Python bridge vs Rust-native (decide at start of Phase 3)
@@ -245,13 +331,14 @@ major choice without hesitating.
   demo time; `solana-test-validator` from either works)
 - Whether to pin `frost-ed25519` at 3.0.x vs. tracking newer releases (pin at 3.0.0;
   re-check right before Phase 4 starts, not now)
+- Bitcoin regtest and Cosmos broadcast (Phase 7): re-verify against real
+  `bitcoind`/`gaiad`/`simd` nodes — only checked by compilation/unit tests and an
+  untested-in-sandbox `demo.sh` step in the environment this was built in
 
 ## Out of scope (your own report already calls these "Future Scope" — leave them there)
 
 - GUI (Tauri desktop app)
-- Multi-chain signing (Bitcoin Schnorr, Cosmos — Solana is now in scope as the primary chain)
 - Proactive secret sharing / periodic key refresh
-- QR-code based air-gapped Mode B
 - Formal third-party security audit
 
 ---
