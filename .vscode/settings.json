@@ -18,6 +18,4 @@
     "rust-analyzer.files.exclude": [
         "target"
     ],
-
-    "explorer.excludeGitIgnore": true
 }
