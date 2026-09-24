@@ -6,6 +6,7 @@
 //! same seed is dealer-split into key shares so signing never reconstructs the
 //! key on any machine.
 
+pub mod ai_anomaly;
 pub mod audit;
 pub mod bitcoin;
 pub mod btc_mpc;

@@ -1127,6 +1127,55 @@ horcrux sign shard-1.hx shard-2.hx --password guardian ...
 # access audit blocked the attempt: 3 failed decrypt attempts within the last 3600s
 ```
 
+### AI anomaly check
+
+`horcrux ai-check` sends the tail of the access log to a free model on
+[OpenRouter](https://openrouter.ai/keys) and asks it to flag anything a human
+analyst would find suspicious. It is a second, fuzzier opinion alongside the
+rule-based scorer above — purely advisory, and it never blocks signing.
+
+Give it an API key with `horcrux ai-setup` (prompts if `--api-key` is
+omitted, and saves to a local `.env` file), or export the environment
+variable yourself, or set both by hand:
+
+```bash
+horcrux ai-setup                                          # prompts for the key, saves to ./.env
+horcrux ai-setup --api-key sk-or-... --model meta-llama/llama-3.3-70b-instruct:free
+# or:
+export OPENROUTER_API_KEY=sk-or-...
+```
+
+`.env` (in the current directory or an ancestor) is loaded automatically on
+every `horcrux` invocation; a real environment variable always takes
+precedence. `horcrux ai-setup` also reminds you to add `.env` to
+`.gitignore` if it isn't already, since it holds a secret key.
+
+```bash
+horcrux ai-check                  # last 50 entries, default free model
+horcrux ai-check --tail 200
+horcrux ai-check --model meta-llama/llama-3.3-70b-instruct:free
+```
+
+```
+AI ANOMALY WARNING [meta-llama/llama-3.3-70b-instruct:free]: three failed decrypts followed by an immediate block, then a successful attempt seconds later
+```
+
+#### Automatic background check before every sign/reconstruct
+
+Whenever an API key is configured, `reconstruct`, `sign`, `mpc-sign`,
+`qr-commit`, and `qr-share` also fire this same check in the background the
+moment the rule-based audit pre-flight runs — concurrently with the actual
+decrypt/sign work, so it adds no latency unless the model responds slower
+than the signing operation itself. If the model flags the recent history as
+anomalous, a warning prints to stderr once the command finishes:
+
+```
+AI ANOMALY WARNING [meta-llama/llama-3.3-70b-instruct:free]: three failed decrypts followed by an immediate block, then a successful attempt seconds later
+```
+
+With no API key configured, this is skipped entirely — nothing changes for
+users who haven't set one up.
+
 ---
 
 # Configuration
@@ -1143,6 +1192,8 @@ each shard's metadata rather than in a separate config.
 | `HORCRUX_BTC_RPC_URL` | Bitcoin Core RPC endpoint | `http://127.0.0.1:18443` |
 | `HORCRUX_COSMOS_RPC_URL` | Cosmos Tendermint RPC endpoint | `http://127.0.0.1:26657` |
 | `HORCRUX_ACCESS_LOG` | Access log path | `./horcrux-access.log` |
+| `OPENROUTER_API_KEY` | OpenRouter API key for `ai-check` | none (required for `ai-check`) |
+| `HORCRUX_AI_MODEL` | OpenRouter model id for `ai-check` | `meta-llama/llama-3.3-70b-instruct:free` |
 
 ## CLI Flags
 
