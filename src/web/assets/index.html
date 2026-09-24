@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>HORCRUX — Local Console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0f16'/%3E%3Cpath d='M16 6l8 4v6c0 6-3.6 9.6-8 10-4.4-.4-8-4-8-10v-6l8-4z' fill='none' stroke='%234ee1c2' stroke-width='2'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+
+<div class="shell">
+  <aside class="rail">
+    <div class="rail-brand">
+      <svg viewBox="0 0 32 32" width="22" height="22"><path d="M16 4l10 5v7c0 7.4-4.4 11.9-10 12.6C10.4 27.9 6 23.4 6 16V9l10-5z" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+      <span>HORCRUX</span>
+    </div>
+    <p class="rail-tag">Local console · Solana MVP</p>
+    <nav class="rail-nav" id="railNav">
+      <button class="rail-item is-active" data-section="log">
+        <span class="rail-ic">⏱</span> Access log
+      </button>
+      <button class="rail-item" data-section="verify">
+        <span class="rail-ic">✓</span> Verify
+      </button>
+      <button class="rail-item" data-section="init">
+        <span class="rail-ic">✂</span> Init <em>Mode A split</em>
+      </button>
+      <button class="rail-item" data-section="sign">
+        <span class="rail-ic">✎</span> Sign <em>Mode A</em>
+      </button>
+      <button class="rail-item" data-section="mpc">
+        <span class="rail-ic">◈</span> MPC <em>Mode B</em>
+      </button>
+    </nav>
+    <div class="rail-footer">
+      <div class="token-state" id="tokenState">checking token…</div>
+      <p class="rail-hint">Bound to 127.0.0.1 only. Paths below are read from disk on this machine, never uploaded from the browser.</p>
+    </div>
+  </aside>
+
+  <main class="content">
+
+    <section class="panel" id="section-log" data-section>
+      <header class="panel-head">
+        <h1>Access log</h1>
+        <p>Read-only, append-only. Every shard decryption attempt this machine has recorded.</p>
+      </header>
+      <div class="toolbar">
+        <label class="field-inline">
+          Tail
+          <input type="number" id="logTail" min="1" placeholder="all" style="width:90px" />
+        </label>
+        <button class="btn btn-outline" id="logReload">Reload</button>
+      </div>
+      <div id="logResult" class="result"></div>
+    </section>
+
+    <section class="panel" id="section-verify" data-section hidden>
+      <header class="panel-head">
+        <h1>Verify</h1>
+        <p>Structural integrity check for shard/share files. Never decrypts into the clear, never touches the access log.</p>
+      </header>
+      <form id="verifyForm" class="form-grid">
+        <label class="field">
+          <span>Files (one path per line)</span>
+          <textarea name="files" rows="4" placeholder="shards/shard-1.hx&#10;shards/shard-2.hx" required></textarea>
+        </label>
+        <label class="field">
+          <span>Password <em>(optional — checks the AES-GCM auth tag)</em></span>
+          <input type="password" name="password" autocomplete="off" />
+        </label>
+        <div class="form-actions">
+          <button class="btn btn-primary" type="submit">Verify files</button>
+        </div>
+      </form>
+      <div id="verifyResult" class="result"></div>
+    </section>
+
+    <section class="panel" id="section-init" data-section hidden>
+      <header class="panel-head">
+        <h1>Init — Mode A split</h1>
+        <p>Split a private key into encrypted shard files with Shamir's Secret Sharing.</p>
+      </header>
+      <form id="initForm" class="form-grid">
+        <div class="field-row">
+          <label class="field">
+            <span>Threshold</span>
+            <input type="number" name="threshold" value="2" min="1" required />
+          </label>
+          <label class="field">
+            <span>Shares</span>
+            <input type="number" name="shares" value="3" min="1" required />
+          </label>
+        </div>
+        <label class="field checkbox-field">
+          <input type="checkbox" name="generate" />
+          <span>Generate a disposable test key <em>(shown once — never use for real funds)</em></span>
+        </label>
+        <label class="field">
+          <span>Private key hex <em>(64 hex chars, optional 0x — disabled when generating)</em></span>
+          <input type="text" name="key_hex" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="field">
+          <span>Output directory</span>
+          <input type="text" name="out_dir" value="shards" />
+        </label>
+        <label class="field">
+          <span>Password <em>(applied to every shard)</em></span>
+          <input type="password" name="password" autocomplete="off" required />
+        </label>
+        <div class="form-actions">
+          <button class="btn btn-primary" type="submit">Split key</button>
+        </div>
+      </form>
+      <div id="initResult" class="result"></div>
+    </section>
+
+    <section class="panel" id="section-sign" data-section hidden>
+      <header class="panel-head">
+        <h1>Sign — Mode A</h1>
+        <p>Reconstruct the key from a threshold of shards, sign a Solana transfer offline, zeroize, optionally broadcast.</p>
+      </header>
+      <form id="signForm" class="form-grid">
+        <label class="field">
+          <span>Shard files (one path per line)</span>
+          <textarea name="shards" rows="3" placeholder="shards/shard-1.hx&#10;shards/shard-2.hx" required></textarea>
+        </label>
+        <label class="field">
+          <span>Password <em>(applied to every selected shard)</em></span>
+          <input type="password" name="password" autocomplete="off" required />
+        </label>
+        <div class="field-row">
+          <label class="field">
+            <span>Recipient address (base58)</span>
+            <input type="text" name="to" required />
+          </label>
+          <label class="field">
+            <span>Lamports</span>
+            <input type="number" name="lamports" min="0" required />
+          </label>
+        </div>
+        <label class="field">
+          <span>Blockhash <em>(base58 — leave empty to fetch when broadcasting)</em></span>
+          <input type="text" name="blockhash" />
+        </label>
+        <div class="field-row">
+          <label class="field checkbox-field">
+            <input type="checkbox" name="broadcast" />
+            <span>Broadcast to a Solana cluster</span>
+          </label>
+          <label class="field">
+            <span>RPC URL <em>(optional override)</em></span>
+            <input type="text" name="rpc_url" placeholder="http://127.0.0.1:8899" />
+          </label>
+        </div>
+        <label class="field checkbox-field force-field" hidden>
+          <input type="checkbox" name="force" />
+          <span>Force through the audit block <em>(overridden attempts are still logged)</em></span>
+        </label>
+        <div class="form-actions">
+          <button class="btn btn-primary" type="submit">Sign transaction</button>
+        </div>
+      </form>
+      <div id="signResult" class="result"></div>
+    </section>
+
+    <section class="panel" id="section-mpc" data-section hidden>
+      <header class="panel-head">
+        <h1>MPC — Mode B</h1>
+        <p>Dealer-split into FROST key shares, or sign with a threshold subset. The full key is never reconstructed on any machine.</p>
+      </header>
+      <div class="tabbar">
+        <button class="tab is-active" data-mpc-tab="split">Split</button>
+        <button class="tab" data-mpc-tab="sign">Sign</button>
+      </div>
+
+      <form id="mpcSplitForm" class="form-grid mpc-tab" data-mpc-tab="split">
+        <div class="field-row">
+          <label class="field">
+            <span>Threshold <em>(min 2)</em></span>
+            <input type="number" name="threshold" value="2" min="2" required />
+          </label>
+          <label class="field">
+            <span>Shares</span>
+            <input type="number" name="shares" value="3" min="2" required />
+          </label>
+        </div>
+        <label class="field checkbox-field">
+          <input type="checkbox" name="generate" />
+          <span>Generate a disposable test key <em>(shown once)</em></span>
+        </label>
+        <label class="field">
+          <span>Private key hex</span>
+          <input type="text" name="key_hex" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="field">
+          <span>Output directory</span>
+          <input type="text" name="out_dir" value="mpc" />
+        </label>
+        <label class="field">
+          <span>Password <em>(applied to every share)</em></span>
+          <input type="password" name="password" autocomplete="off" required />
+        </label>
+        <div class="form-actions">
+          <button class="btn btn-primary" type="submit">Split key (FROST)</button>
+        </div>
+      </form>
+
+      <form id="mpcSignForm" class="form-grid mpc-tab" data-mpc-tab="sign" hidden>
+        <label class="field">
+          <span>Key share files (one path per line)</span>
+          <textarea name="shares" rows="3" placeholder="mpc/mpc-1.hx&#10;mpc/mpc-2.hx" required></textarea>
+        </label>
+        <label class="field">
+          <span>Group directory <em>(contains group.pub)</em></span>
+          <input type="text" name="group_dir" value="mpc" />
+        </label>
+        <label class="field">
+          <span>Password <em>(applied to every selected share)</em></span>
+          <input type="password" name="password" autocomplete="off" required />
+        </label>
+        <div class="field-row">
+          <label class="field">
+            <span>Recipient address (base58)</span>
+            <input type="text" name="to" required />
+          </label>
+          <label class="field">
+            <span>Lamports</span>
+            <input type="number" name="lamports" min="0" required />
+          </label>
+        </div>
+        <label class="field">
+          <span>Blockhash <em>(optional — fetched when broadcasting)</em></span>
+          <input type="text" name="blockhash" />
+        </label>
+        <div class="field-row">
+          <label class="field checkbox-field">
+            <input type="checkbox" name="broadcast" />
+            <span>Broadcast to a Solana cluster</span>
+          </label>
+          <label class="field">
+            <span>RPC URL <em>(optional override)</em></span>
+            <input type="text" name="rpc_url" placeholder="http://127.0.0.1:8899" />
+          </label>
+        </div>
+        <label class="field checkbox-field force-field" hidden>
+          <input type="checkbox" name="force" />
+          <span>Force through the audit block <em>(overridden attempts are still logged)</em></span>
+        </label>
+        <div class="form-actions">
+          <button class="btn btn-primary" type="submit">Sign with FROST</button>
+        </div>
+      </form>
+
+      <div id="mpcResult" class="result"></div>
+    </section>
+
+  </main>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

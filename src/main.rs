@@ -1,4 +1,5 @@
 mod tui;
+mod web;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use horcrux::error::Error;
@@ -412,6 +413,16 @@ enum Command {
     },
     /// Launch the interactive terminal UI.
     Tui,
+    /// Launch a local, loopback-only web UI covering the same Solana MVP
+    /// flows as the TUI (Access log, Verify, Init, Sign, MPC split/sign), for
+    /// guardians who would rather use a browser. Binds 127.0.0.1 only and
+    /// requires a per-run token printed at startup; nothing off this machine
+    /// can reach it.
+    Web {
+        /// Port to listen on.
+        #[arg(long, default_value_t = 7420)]
+        port: u16,
+    },
 }
 
 #[tokio::main]
@@ -1310,6 +1321,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Tui => tui::run().await?,
+        Command::Web { port } => web::run(port).await?,
     }
     Ok(())
 }

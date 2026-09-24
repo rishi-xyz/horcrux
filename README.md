@@ -525,7 +525,11 @@ horcrux/
 │   ├── chain.rs        Solana RPC broadcast / blockhash / balance
 │   ├── audit.rs        access log + anomaly scorer
 │   ├── verify.rs       passive shard integrity checks
-│   └── error.rs        typed error enum
+│   ├── error.rs        typed error enum
+│   ├── tui/            interactive terminal UI (`horcrux tui`)
+│   └── web/            local loopback-only web UI (`horcrux web`)
+│
+├── site/               marketing/docs site (Next.js + React + Tailwind CSS — install guide, demo video slot)
 │
 ├── tests/
 │   ├── roundtrip.rs
@@ -680,6 +684,7 @@ horcrux
 ├── verify
 ├── log
 ├── tui           (interactive terminal UI)
+├── web           (local, loopback-only web UI)
 └── help
 ```
 
@@ -1035,6 +1040,52 @@ Sign go straight from decrypted key to signed output without the key ever
 becoming on-screen state. The one exception, matching the CLI's own
 behavior, is a freshly **generated** disposable test key on the Init/MPC
 Split screens, shown once with an explicit "shown once" label.
+
+---
+
+## Local Web UI
+
+A browser-based alternative to the TUI, for guardians who'd rather fill in a
+form than navigate a terminal. Covers the exact same Solana MVP flows —
+Access log, Verify, Init, Sign, MPC split/sign — backed by the same library
+code as the CLI and TUI.
+
+```bash
+horcrux web
+horcrux web --port 7420
+```
+
+```
+HORCRUX web UI (loopback-only, matches the TUI's Solana MVP scope)
+
+  http://127.0.0.1:7420/?token=6f1c...e0a9
+
+Open that URL in a browser on this machine. The token above is required for every
+action; anyone or anything that reaches this port without it gets 401. Nothing
+beyond 127.0.0.1 can reach this server. Press Ctrl+C to stop.
+```
+
+Security model:
+
+- The listener only ever binds `127.0.0.1` — never `0.0.0.0` — so nothing off
+  this machine can reach it, matching the project's offline-first posture.
+- Every `/api/*` call must carry a random per-run token (printed once at
+  startup and pre-filled into the printed URL) in an `X-Horcrux-Token`
+  header. A custom header forces a CORS preflight that this server does not
+  answer for other origins, so a malicious page cannot forge these requests
+  even if it guesses the port.
+- The static page itself carries no secrets and is served without the token
+  so it can load before it knows the token from its own URL.
+- Shard/share paths are read directly from disk on the machine running
+  `horcrux web`, exactly like the CLI and TUI — files are never uploaded
+  from the browser.
+- Exactly like the CLI and TUI: a `Block` audit verdict refuses the
+  operation until the request explicitly sets `force` (still logged when
+  overridden); a `Warn` verdict proceeds immediately with the warnings
+  surfaced in the response.
+- No response ever includes a reconstructed private key or seed, with the
+  same one exception as the CLI/TUI: a freshly **generated** disposable test
+  key on Init/MPC-split, returned once and never persisted.
 
 ---
 
