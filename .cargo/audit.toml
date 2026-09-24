@@ -1,0 +1,21 @@
+[advisories]
+# These are pulled in transitively by cosmrs 0.22.0 (the latest release on
+# crates.io) via its `tendermint-rpc` -> `reqwest 0.11` -> old `hyper`/`h2`/
+# `rustls 0.21` chain. No newer cosmrs release exists yet to pick up patched
+# versions, so a `cargo update` cannot fix these. Re-check and drop these
+# entries once cosmrs ships a release on a newer reqwest/hyper stack.
+ignore = [
+    # h2: unbounded empty DATA frames (DoS) if a stream is never drained.
+    # Only reachable through the Cosmos RPC client's HTTP/2 connections.
+    "RUSTSEC-2026-0258",
+    # rustls-webpki: panic parsing a CRL's onlySomeReasons bit string.
+    # We never parse certificate revocation lists.
+    "RUSTSEC-2026-0104",
+    # rustls-webpki: wildcard names incorrectly accepted under a permitted
+    # name constraint. Requires a misissued cert to exploit; not reachable
+    # through our own certificate handling.
+    "RUSTSEC-2026-0099",
+    # rustls-webpki: URI name constraints incorrectly accepted. Same
+    # misissuance-only reachability as above.
+    "RUSTSEC-2026-0098",
+]
