@@ -6,6 +6,8 @@ use axum::Json;
 use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use horcrux::audit::{AccessLog, Entry, EntryKind, Scorer, Verdict};
 use horcrux::error::Error;
 use serde::Deserialize;
@@ -512,4 +514,68 @@ pub async fn mpc_sign(Json(req): Json<MpcSignReq>) -> Result<Json<Value>, ApiErr
     }
 
     Ok(Json(result))
+}
+
+/// Render a shard/share file on disk as one or more base64-encoded QR PNG
+/// frames, for a guardian to scan onto their own device instead of copying
+/// the file. Reuses the same `qr::encode_message`/`encode_qr_png_bytes`
+/// machinery as the TUI's Ctrl+Q overlay and the CLI's air-gapped `qr-*`
+/// subcommands — no new QR logic, just a byte-level, non-file-writing path.
+#[derive(Deserialize)]
+pub struct ShardQrReq {
+    path: String,
+}
+
+pub async fn shard_qr(Json(req): Json<ShardQrReq>) -> Result<Json<Value>, ApiError> {
+    let path = PathBuf::from(req.path);
+    let frames_b64 = tokio::task::spawn_blocking(move || -> Result<Vec<String>, Error> {
+        let bytes = std::fs::read(&path).map_err(Error::Io)?;
+        let session: [u8; horcrux::qr::SESSION_LEN] = rand::random();
+        let frames =
+            horcrux::qr::encode_message(horcrux::qr::MessageType::ShardFile, session, &bytes)?;
+        frames
+            .iter()
+            .map(|f| Ok(BASE64.encode(horcrux::qr::encode_qr_png_bytes(f, 6)?)))
+            .collect()
+    })
+    .await
+    .map_err(join_err)??;
+
+    Ok(Json(json!({ "frames": frames_b64 })))
+}
+
+/// Decode a single-frame shard/share QR PNG (uploaded as base64 from the
+/// browser — a scanned photo or a saved export) and stage its payload to a
+/// fresh temp `.hx` file on the server, returning that path so the browser
+/// can paste it straight into the existing `shards`/`shares` textarea. The
+/// caller is responsible for eventually removing the temp file; `sign`/
+/// `mpc_sign` read it like any other shard/share path and don't delete it
+/// themselves, matching how a manually-typed path is treated.
+#[derive(Deserialize)]
+pub struct ShardQrImportReq {
+    png_base64: String,
+}
+
+pub async fn shard_qr_import(Json(req): Json<ShardQrImportReq>) -> Result<Json<Value>, ApiError> {
+    let bytes = BASE64
+        .decode(req.png_base64.trim())
+        .map_err(|e| ApiError::message(StatusCode::BAD_REQUEST, format!("invalid base64: {e}")))?;
+
+    let path = tokio::task::spawn_blocking(move || -> Result<PathBuf, Error> {
+        let frame = horcrux::qr::decode_qr_png_bytes(&bytes)?;
+        if frame.message_type != horcrux::qr::MessageType::ShardFile || frame.total != 1 {
+            return Err(Error::Qr(
+                "QR image is not a single-frame shard/share code".into(),
+            ));
+        }
+        let unique: [u8; 8] = rand::random();
+        let tmp =
+            std::env::temp_dir().join(format!("horcrux-qr-import-{}.hx", hex::encode(unique)));
+        std::fs::write(&tmp, &frame.payload).map_err(Error::Io)?;
+        Ok(tmp)
+    })
+    .await
+    .map_err(join_err)??;
+
+    Ok(Json(json!({ "path": path.display().to_string() })))
 }

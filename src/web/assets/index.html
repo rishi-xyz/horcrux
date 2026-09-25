@@ -41,6 +41,10 @@
 
   <main class="content">
 
+    <div class="topbar">
+      <button class="btn btn-outline" id="backBtn" title="Go back">‹ Back</button>
+    </div>
+
     <section class="panel" id="section-log" data-section>
       <header class="panel-head">
         <h1>Access log</h1>
@@ -126,6 +130,10 @@
           <span>Shard files (one path per line)</span>
           <textarea name="shards" rows="3" placeholder="shards/shard-1.hx&#10;shards/shard-2.hx" required></textarea>
         </label>
+        <div class="field-row qr-import-row">
+          <input type="file" id="qrImportInputSign" accept="image/png" multiple />
+          <button class="btn btn-outline" type="button" id="qrImportBtnSign">Import from QR</button>
+        </div>
         <label class="field">
           <span>Password <em>(applied to every selected shard)</em></span>
           <input type="password" name="password" autocomplete="off" required />
@@ -212,6 +220,10 @@
           <span>Key share files (one path per line)</span>
           <textarea name="shares" rows="3" placeholder="mpc/mpc-1.hx&#10;mpc/mpc-2.hx" required></textarea>
         </label>
+        <div class="field-row qr-import-row">
+          <input type="file" id="qrImportInputMpcSign" accept="image/png" multiple />
+          <button class="btn btn-outline" type="button" id="qrImportBtnMpcSign">Import from QR</button>
+        </div>
         <label class="field">
           <span>Group directory <em>(contains group.pub)</em></span>
           <input type="text" name="group_dir" value="mpc" />
