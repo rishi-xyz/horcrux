@@ -202,7 +202,11 @@ pub fn render_audit_modal(frame: &mut Frame, area: Rect, blocking: bool, reasons
         ListItem::new(hint).style(Style::default().fg(theme::MUTED)),
         ListItem::new(""),
     ];
-    lines.extend(reasons.iter().map(|r| ListItem::new(format!("\u{2022} {r}"))));
+    lines.extend(
+        reasons
+            .iter()
+            .map(|r| ListItem::new(format!("\u{2022} {r}"))),
+    );
     lines.push(ListItem::new(""));
     lines.push(ListItem::new(consequence).style(Style::default().fg(theme::MUTED)));
     lines.push(ListItem::new(hint).style(Style::default().fg(theme::MUTED)));

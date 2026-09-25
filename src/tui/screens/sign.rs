@@ -480,7 +480,12 @@ impl SignScreen {
                     .unwrap_or_default()
             );
             if let Some(field) = self.password_by_path.get(path) {
-                field.render(frame, chunks[2 + i], &label, self.focus == Focus::Password(i));
+                field.render(
+                    frame,
+                    chunks[2 + i],
+                    &label,
+                    self.focus == Focus::Password(i),
+                );
             }
         }
         let to_idx = 2 + n;
@@ -502,8 +507,7 @@ impl SignScreen {
             "blockhash (base58 — leave empty to fetch when broadcasting)",
             self.focus == Focus::Blockhash,
         );
-        let (hint_text, hint_style) = if self.blockhash.value().trim().is_empty()
-            && !self.broadcast
+        let (hint_text, hint_style) = if self.blockhash.value().trim().is_empty() && !self.broadcast
         {
             (
                 "REQUIRED: enter a blockhash, or turn Broadcast on (Space) to fetch one.",
@@ -515,7 +519,10 @@ impl SignScreen {
                 Style::default().fg(theme::MUTED),
             )
         };
-        frame.render_widget(Paragraph::new(hint_text).style(hint_style), chunks[to_idx + 3]);
+        frame.render_widget(
+            Paragraph::new(hint_text).style(hint_style),
+            chunks[to_idx + 3],
+        );
 
         let bc_label = format!(
             "[{}] broadcast to a Solana cluster (Space/Enter to toggle)",
@@ -585,7 +592,10 @@ impl SignScreen {
 /// If `path` is a `.png` QR export of a shard, decode it and stage the
 /// payload to a fresh temp `.hx` file, pushing that temp path onto
 /// `temp_files` for later cleanup. Otherwise returns `path` unchanged.
-fn stage_shard_path(path: &std::path::Path, temp_files: &mut Vec<PathBuf>) -> Result<PathBuf, Error> {
+fn stage_shard_path(
+    path: &std::path::Path,
+    temp_files: &mut Vec<PathBuf>,
+) -> Result<PathBuf, Error> {
     if path.extension().is_some_and(|e| e == "png") {
         let staged = horcrux::qr::stage_shard_from_qr_png(path)?;
         temp_files.push(staged.clone());

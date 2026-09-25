@@ -214,14 +214,20 @@ impl MpcScreen {
     /// Keep `split_passwords` and `split_destinations` sized to
     /// `shares_count`, preserving already-typed values at surviving indices.
     fn sync_split_guardians(&mut self) {
-        let parsed = self.shares_count.value().trim().parse::<usize>().unwrap_or(0);
+        let parsed = self
+            .shares_count
+            .value()
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(0);
         let n = if parsed == 0 {
             self.split_passwords.len()
         } else {
             parsed
         };
         self.split_passwords.resize_with(n, TextField::masked);
-        self.split_destinations.resize_with(n, GuardianDest::default);
+        self.split_destinations
+            .resize_with(n, GuardianDest::default);
     }
 
     /// Cycle guardian `i`'s destination: this device -> each detected
@@ -996,7 +1002,10 @@ impl MpcScreen {
                         field.render(
                             frame,
                             row_area,
-                            &format!("password for share {} of {n} (distinct per guardian)", i + 1),
+                            &format!(
+                                "password for share {} of {n} (distinct per guardian)",
+                                i + 1
+                            ),
                             self.focus == Focus::SplitPassword(i),
                         );
                     }
@@ -1052,7 +1061,11 @@ impl MpcScreen {
     fn render_sign(&self, frame: &mut Frame, area: Rect) {
         let selected = self.picker.selected();
         let n = selected.len();
-        let mut constraints = vec![Constraint::Length(3), Constraint::Length(3), Constraint::Length(6)];
+        let mut constraints = vec![
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(6),
+        ];
         constraints.extend(std::iter::repeat_n(Constraint::Length(3), n));
         constraints.extend([
             Constraint::Length(3), // To
@@ -1089,7 +1102,12 @@ impl MpcScreen {
                     .unwrap_or_default()
             );
             if let Some(field) = self.password_by_path.get(path) {
-                field.render(frame, chunks[3 + i], &label, self.focus == Focus::SignPassword(i));
+                field.render(
+                    frame,
+                    chunks[3 + i],
+                    &label,
+                    self.focus == Focus::SignPassword(i),
+                );
             }
         }
         let to_idx = 3 + n;
@@ -1111,8 +1129,7 @@ impl MpcScreen {
             "blockhash (base58 — leave empty to fetch when broadcasting)",
             self.focus == Focus::Blockhash,
         );
-        let (hint_text, hint_style) = if self.blockhash.value().trim().is_empty()
-            && !self.broadcast
+        let (hint_text, hint_style) = if self.blockhash.value().trim().is_empty() && !self.broadcast
         {
             (
                 "REQUIRED: enter a blockhash, or turn Broadcast on (Space) to fetch one.",
@@ -1124,7 +1141,10 @@ impl MpcScreen {
                 Style::default().fg(theme::MUTED),
             )
         };
-        frame.render_widget(Paragraph::new(hint_text).style(hint_style), chunks[to_idx + 3]);
+        frame.render_widget(
+            Paragraph::new(hint_text).style(hint_style),
+            chunks[to_idx + 3],
+        );
 
         let bc_label = format!(
             "[{}] broadcast to a Solana cluster",
@@ -1191,7 +1211,10 @@ fn focus_style(focused: bool) -> Style {
 /// payload to a fresh temp `.hx` file, pushing that temp path onto
 /// `temp_files` for later cleanup. Otherwise returns `path` unchanged. See
 /// `screens::sign`'s equivalent.
-fn stage_shard_path(path: &std::path::Path, temp_files: &mut Vec<PathBuf>) -> Result<PathBuf, Error> {
+fn stage_shard_path(
+    path: &std::path::Path,
+    temp_files: &mut Vec<PathBuf>,
+) -> Result<PathBuf, Error> {
     if path.extension().is_some_and(|e| e == "png") {
         let staged = horcrux::qr::stage_shard_from_qr_png(path)?;
         temp_files.push(staged.clone());
@@ -1218,7 +1241,11 @@ fn load_qr_pages(path: &std::path::Path) -> Result<Vec<String>, Error> {
 }
 
 fn render_qr_overlay(frame: &mut Frame, area: Rect, overlay: &QrOverlay, total_shares: usize) {
-    let text = overlay.pages.get(overlay.frame_index).cloned().unwrap_or_default();
+    let text = overlay
+        .pages
+        .get(overlay.frame_index)
+        .cloned()
+        .unwrap_or_default();
     let content_w = text.lines().map(|l| l.chars().count()).max().unwrap_or(20) as u16;
     let content_h = text.lines().count() as u16;
     let width = (content_w + 4).clamp(24, area.width.saturating_sub(2));

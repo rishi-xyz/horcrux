@@ -161,7 +161,11 @@ impl InitScreen {
         ];
         for i in 0..self.passwords.len() {
             order.push(Focus::Dest(i));
-            if self.destinations.get(i).is_some_and(|d| d.choice == DestChoice::Custom) {
+            if self
+                .destinations
+                .get(i)
+                .is_some_and(|d| d.choice == DestChoice::Custom)
+            {
                 order.push(Focus::CustomPath(i));
             }
             order.push(Focus::Password(i));
@@ -443,7 +447,11 @@ impl InitScreen {
         let mut guardian_rows: Vec<Focus> = Vec::new();
         for i in 0..self.passwords.len() {
             guardian_rows.push(Focus::Dest(i));
-            if self.destinations.get(i).is_some_and(|d| d.choice == DestChoice::Custom) {
+            if self
+                .destinations
+                .get(i)
+                .is_some_and(|d| d.choice == DestChoice::Custom)
+            {
                 guardian_rows.push(Focus::CustomPath(i));
             }
             guardian_rows.push(Focus::Password(i));
@@ -498,7 +506,10 @@ impl InitScreen {
             let area = chunks[5 + row_offset];
             match *row {
                 Focus::Dest(i) => {
-                    let label = format!("destination for shard {} of {n} (Left/Right to change, r to rescan)", i + 1);
+                    let label = format!(
+                        "destination for shard {} of {n} (Left/Right to change, r to rescan)",
+                        i + 1
+                    );
                     let style = if self.focus == Focus::Dest(i) {
                         Style::default().fg(theme::ACCENT)
                     } else {
@@ -526,7 +537,10 @@ impl InitScreen {
                         field.render(
                             frame,
                             area,
-                            &format!("password for shard {} of {n} (distinct per guardian)", i + 1),
+                            &format!(
+                                "password for shard {} of {n} (distinct per guardian)",
+                                i + 1
+                            ),
                             self.focus == Focus::Password(i),
                         );
                     }
@@ -591,7 +605,11 @@ fn load_qr_pages(path: &std::path::Path) -> Result<Vec<String>, Error> {
 }
 
 fn render_qr_overlay(frame: &mut Frame, area: Rect, overlay: &QrOverlay, total_shards: usize) {
-    let text = overlay.pages.get(overlay.frame_index).cloned().unwrap_or_default();
+    let text = overlay
+        .pages
+        .get(overlay.frame_index)
+        .cloned()
+        .unwrap_or_default();
     let content_w = text.lines().map(|l| l.chars().count()).max().unwrap_or(20) as u16;
     let content_h = text.lines().count() as u16;
     let width = (content_w + 4).clamp(24, area.width.saturating_sub(2));

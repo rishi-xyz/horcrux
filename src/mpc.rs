@@ -177,9 +177,10 @@ pub fn mpc_split(
     passwords: &[String],
 ) -> Result<(Vec<PathBuf>, PathBuf), Error> {
     fs::create_dir_all(out_dir)?;
-    let (paths, group_bytes) = build_frost_shares(key, threshold, share_count, passwords, |id, _i| {
-        out_dir.join(format!("mpc-{id}.hx"))
-    })?;
+    let (paths, group_bytes) =
+        build_frost_shares(key, threshold, share_count, passwords, |id, _i| {
+            out_dir.join(format!("mpc-{id}.hx"))
+        })?;
     let group_path = out_dir.join(GROUP_PUB_FILENAME);
     fs::write(&group_path, group_bytes).map_err(Error::Io)?;
     Ok((paths, group_path))
@@ -213,9 +214,10 @@ pub fn mpc_split_to(
         }
     }
     fs::create_dir_all(group_out_dir)?;
-    let (paths, group_bytes) = build_frost_shares(key, threshold, share_count, passwords, |_id, i| {
-        share_destinations[i].clone()
-    })?;
+    let (paths, group_bytes) =
+        build_frost_shares(key, threshold, share_count, passwords, |_id, i| {
+            share_destinations[i].clone()
+        })?;
     let group_path = group_out_dir.join(GROUP_PUB_FILENAME);
     fs::write(&group_path, group_bytes).map_err(Error::Io)?;
     Ok((paths, group_path))
