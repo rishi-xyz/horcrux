@@ -14,14 +14,15 @@
 
 use crate::tui::action::AppEvent;
 use crate::tui::theme;
-use crate::tui::widgets::{FileChecklist, TextField};
+use crate::tui::widgets::{FileChecklist, TextField, render_audit_modal};
 use crossterm::event::{KeyCode, KeyEvent};
 use horcrux::audit::{AccessLog, Entry, Scorer, Verdict};
 use horcrux::error::Error;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
@@ -30,23 +31,13 @@ use tokio::sync::mpsc::UnboundedSender;
 enum Focus {
     Dir,
     Files,
-    Password,
+    Password(usize),
     To,
     Lamports,
     Blockhash,
     Broadcast,
     Submit,
 }
-const FOCUS_ORDER: [Focus; 8] = [
-    Focus::Dir,
-    Focus::Files,
-    Focus::Password,
-    Focus::To,
-    Focus::Lamports,
-    Focus::Blockhash,
-    Focus::Broadcast,
-    Focus::Submit,
-];
 
 /// A pending audit verdict the user must resolve before signing proceeds.
 struct Modal {
@@ -56,11 +47,24 @@ struct Modal {
     reasons: Vec<String>,
     attempt: u64,
     shards: Vec<PathBuf>,
+    /// Passwords snapshotted at submit time, in the same order as `shards`,
+    /// so resolving the modal later reuses exactly what was entered then.
+    passwords: Vec<String>,
+    /// Temp `.hx` files staged from any `.png` QR imports among `shards`,
+    /// to be deleted however the modal is resolved (forced through,
+    /// continued past, or cancelled).
+    temp_files: Vec<PathBuf>,
 }
 
 pub struct SignScreen {
     picker: FileChecklist,
-    password: TextField,
+    /// One password per currently-selected shard file, keyed by path (the
+    /// selected set is dynamic, unlike Init's fixed shard count). Entries
+    /// are added lazily and never pruned on uncheck, so re-checking a box
+    /// doesn't force retyping. A single shared password here was the root
+    /// cause of shards created with per-guardian passwords being unable to
+    /// reconstruct from the TUI.
+    password_by_path: HashMap<PathBuf, TextField>,
     to: TextField,
     lamports: TextField,
     blockhash: TextField,
@@ -78,7 +82,7 @@ impl Default for SignScreen {
         picker.dir.set_value("shards");
         Self {
             picker,
-            password: TextField::masked(),
+            password_by_path: HashMap::new(),
             to: TextField::default(),
             lamports: TextField::default(),
             blockhash: TextField::default(),
@@ -117,6 +121,31 @@ impl SignScreen {
         }
     }
 
+    /// Ensure every currently-selected shard has a password field, adding
+    /// one lazily for newly-checked paths. Never removes entries for
+    /// unchecked paths, so toggling a box off and back on keeps what was
+    /// typed.
+    fn sync_passwords(&mut self) {
+        for path in self.picker.selected() {
+            self.password_by_path
+                .entry(path)
+                .or_insert_with(TextField::masked);
+        }
+    }
+
+    fn order(&self) -> Vec<Focus> {
+        let mut order = vec![Focus::Dir, Focus::Files];
+        order.extend((0..self.picker.selected().len()).map(Focus::Password));
+        order.extend([
+            Focus::To,
+            Focus::Lamports,
+            Focus::Blockhash,
+            Focus::Broadcast,
+            Focus::Submit,
+        ]);
+        order
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent, worker_tx: &UnboundedSender<AppEvent>) {
         if self.busy {
             return;
@@ -132,6 +161,7 @@ impl SignScreen {
                 Focus::Dir => {
                     if key.code == KeyCode::Enter {
                         self.picker.rescan();
+                        self.sync_passwords();
                     } else {
                         self.picker.dir.handle_key(key);
                     }
@@ -139,10 +169,21 @@ impl SignScreen {
                 Focus::Files => match key.code {
                     KeyCode::Up => self.picker.move_up(),
                     KeyCode::Down => self.picker.move_down(),
-                    KeyCode::Char(' ') | KeyCode::Enter => self.picker.toggle(),
+                    KeyCode::Char(' ') | KeyCode::Enter => {
+                        self.picker.toggle();
+                        self.sync_passwords();
+                    }
                     _ => {}
                 },
-                Focus::Password => self.password.handle_key(key),
+                Focus::Password(i) => {
+                    let selected = self.picker.selected();
+                    if let Some(path) = selected.get(i) {
+                        self.password_by_path
+                            .entry(path.clone())
+                            .or_insert_with(TextField::masked)
+                            .handle_key(key);
+                    }
+                }
                 Focus::To => self.to.handle_key(key),
                 Focus::Lamports => self.lamports.handle_key(key),
                 Focus::Blockhash => self.blockhash.handle_key(key),
@@ -163,39 +204,85 @@ impl SignScreen {
     fn handle_modal_key(&mut self, key: KeyEvent, worker_tx: &UnboundedSender<AppEvent>) {
         let Some(modal) = &self.modal else { return };
         match key.code {
-            KeyCode::Esc => self.modal = None,
+            KeyCode::Esc => {
+                let modal = self.modal.take().expect("checked above");
+                cleanup_temp_files(&modal.temp_files);
+            }
             KeyCode::Char('f') | KeyCode::Char('F') if modal.blocking => {
                 let modal = self.modal.take().expect("checked above");
-                self.begin_sign(modal.shards, modal.attempt, worker_tx);
+                self.begin_sign(
+                    modal.shards,
+                    modal.passwords,
+                    modal.attempt,
+                    modal.temp_files,
+                    worker_tx,
+                );
             }
             KeyCode::Enter if !modal.blocking => {
                 let modal = self.modal.take().expect("checked above");
-                self.begin_sign(modal.shards, modal.attempt, worker_tx);
+                self.begin_sign(
+                    modal.shards,
+                    modal.passwords,
+                    modal.attempt,
+                    modal.temp_files,
+                    worker_tx,
+                );
             }
             _ => {}
         }
     }
 
     fn move_focus(&mut self, dir: i32) {
-        let idx = FOCUS_ORDER
-            .iter()
-            .position(|f| *f == self.focus)
-            .unwrap_or(0) as i32;
-        let n = FOCUS_ORDER.len() as i32;
+        self.sync_passwords();
+        let order = self.order();
+        let idx = order.iter().position(|f| *f == self.focus).unwrap_or(0) as i32;
+        let n = order.len() as i32;
         let next = ((idx + dir) % n + n) % n;
-        self.focus = FOCUS_ORDER[next as usize];
+        self.focus = order[next as usize];
     }
 
     /// Score the proposed attempt against the access log before any key
     /// material is touched, exactly mirroring the CLI's `audit_preflight`.
     fn try_submit(&mut self, worker_tx: &UnboundedSender<AppEvent>) {
-        let shards = self.picker.selected();
-        if shards.is_empty() {
+        let selected = self.picker.selected();
+        if selected.is_empty() {
             return;
         }
+        if self.blockhash.value().trim().is_empty() && !self.broadcast {
+            return;
+        }
+        self.sync_passwords();
+        // Passwords are keyed by the originally selected path (what the
+        // guardian actually typed a password against), before any `.png` QR
+        // import is staged to a temp `.hx` file below.
+        let passwords: Vec<String> = selected
+            .iter()
+            .map(|p| {
+                self.password_by_path
+                    .get(p)
+                    .map(|f| f.value().to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        let mut temp_files = Vec::new();
+        let shards: Vec<PathBuf> = match selected
+            .iter()
+            .map(|p| stage_shard_path(p, &mut temp_files))
+            .collect::<Result<_, _>>()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                cleanup_temp_files(&temp_files);
+                self.signed = Some(Err(e));
+                return;
+            }
+        };
+
         let ids = match horcrux::audit::shard_ids(&shards) {
             Ok(ids) => ids,
             Err(e) => {
+                cleanup_temp_files(&temp_files);
                 self.signed = Some(Err(e));
                 return;
             }
@@ -213,6 +300,8 @@ impl SignScreen {
                     reasons,
                     attempt,
                     shards,
+                    passwords,
+                    temp_files,
                 });
             }
             Verdict::Warn(reasons) => {
@@ -221,16 +310,20 @@ impl SignScreen {
                     reasons,
                     attempt,
                     shards,
+                    passwords,
+                    temp_files,
                 });
             }
-            Verdict::Allow => self.begin_sign(shards, attempt, worker_tx),
+            Verdict::Allow => self.begin_sign(shards, passwords, attempt, temp_files, worker_tx),
         }
     }
 
     fn begin_sign(
         &mut self,
         shards: Vec<PathBuf>,
+        passwords: Vec<String>,
         attempt: u64,
+        temp_files: Vec<PathBuf>,
         worker_tx: &UnboundedSender<AppEvent>,
     ) {
         let to: solana_pubkey::Pubkey = match self.to.value().trim().parse() {
@@ -248,8 +341,10 @@ impl SignScreen {
             }
         };
         let blockhash_input = self.blockhash.value().trim().to_string();
-        let password = self.password.value().to_string();
         let broadcast = self.broadcast;
+        if blockhash_input.is_empty() && !broadcast {
+            return;
+        }
 
         self.busy = true;
         self.signed = None;
@@ -266,6 +361,7 @@ impl SignScreen {
                         let _ = tx.send(AppEvent::SignDone(Err(Error::Tx(format!(
                             "invalid blockhash: {e}"
                         )))));
+                        cleanup_temp_files(&temp_files);
                         return;
                     }
                 }
@@ -275,6 +371,7 @@ impl SignScreen {
                     Ok(h) => h,
                     Err(e) => {
                         let _ = tx.send(AppEvent::SignDone(Err(e)));
+                        cleanup_temp_files(&temp_files);
                         return;
                     }
                 }
@@ -283,10 +380,10 @@ impl SignScreen {
                     "offline signing requires a blockhash (or turn on Broadcast to fetch one)"
                         .into(),
                 ))));
+                cleanup_temp_files(&temp_files);
                 return;
             };
 
-            let passwords = vec![password; shards.len()];
             let sign_result: Result<horcrux::tx::SignedTx, Error> =
                 tokio::task::spawn_blocking(move || {
                     let log = AccessLog::open(horcrux::audit::resolve_log_path(None));
@@ -304,6 +401,11 @@ impl SignScreen {
                 })
                 .await
                 .unwrap_or_else(|e| Err(Error::Tx(format!("worker task panicked: {e}"))));
+
+            // Reconstruction is done (successfully or not) — any staged
+            // temp `.hx` file from a `.png` QR import has served its
+            // purpose and can be removed now.
+            cleanup_temp_files(&temp_files);
 
             let signed = match sign_result {
                 Ok(s) => s,
@@ -345,18 +447,21 @@ impl SignScreen {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        let selected = self.picker.selected();
+        let n = selected.len();
+        let mut constraints = vec![Constraint::Length(3), Constraint::Length(6)];
+        constraints.extend(std::iter::repeat_n(Constraint::Length(3), n));
+        constraints.extend([
+            Constraint::Length(3), // To
+            Constraint::Length(3), // Lamports
+            Constraint::Length(3), // Blockhash
+            Constraint::Length(1), // Blockhash hint
+            Constraint::Length(3), // Broadcast
+            Constraint::Min(0),    // Result
+        ]);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Length(6),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Min(0),
-            ])
+            .constraints(constraints)
             .split(area);
 
         self.picker.dir.render(
@@ -367,26 +472,50 @@ impl SignScreen {
         );
         self.picker
             .render(frame, chunks[1], self.focus == Focus::Files);
-        self.password.render(
-            frame,
-            chunks[2],
-            "password (used for every selected shard)",
-            self.focus == Focus::Password,
-        );
+        for (i, path) in selected.iter().enumerate() {
+            let label = format!(
+                "password for {} (distinct per guardian)",
+                path.file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            );
+            if let Some(field) = self.password_by_path.get(path) {
+                field.render(frame, chunks[2 + i], &label, self.focus == Focus::Password(i));
+            }
+        }
+        let to_idx = 2 + n;
         self.to.render(
             frame,
-            chunks[3],
+            chunks[to_idx],
             "recipient address (base58)",
             self.focus == Focus::To,
         );
-        self.lamports
-            .render(frame, chunks[4], "lamports", self.focus == Focus::Lamports);
+        self.lamports.render(
+            frame,
+            chunks[to_idx + 1],
+            "lamports",
+            self.focus == Focus::Lamports,
+        );
         self.blockhash.render(
             frame,
-            chunks[5],
+            chunks[to_idx + 2],
             "blockhash (base58 — leave empty to fetch when broadcasting)",
             self.focus == Focus::Blockhash,
         );
+        let (hint_text, hint_style) = if self.blockhash.value().trim().is_empty()
+            && !self.broadcast
+        {
+            (
+                "REQUIRED: enter a blockhash, or turn Broadcast on (Space) to fetch one.",
+                Style::default().fg(theme::WARN),
+            )
+        } else {
+            (
+                "optional — required only for offline signing",
+                Style::default().fg(theme::MUTED),
+            )
+        };
+        frame.render_widget(Paragraph::new(hint_text).style(hint_style), chunks[to_idx + 3]);
 
         let bc_label = format!(
             "[{}] broadcast to a Solana cluster (Space/Enter to toggle)",
@@ -401,7 +530,7 @@ impl SignScreen {
             Paragraph::new(bc_label)
                 .style(bc_style)
                 .block(Block::default().borders(Borders::ALL)),
-            chunks[6],
+            chunks[to_idx + 4],
         );
 
         let submit_style = if self.focus == Focus::Submit {
@@ -444,50 +573,31 @@ impl SignScreen {
                     .borders(Borders::ALL)
                     .title("Tab/Shift+Tab focus · Esc back"),
             ),
-            chunks[7],
+            chunks[to_idx + 5],
         );
 
         if let Some(modal) = &self.modal {
-            render_modal(frame, area, modal);
+            render_audit_modal(frame, area, modal.blocking, &modal.reasons);
         }
     }
 }
 
-fn render_modal(frame: &mut Frame, area: Rect, modal: &Modal) {
-    let width = area.width.saturating_sub(8).clamp(20, 70);
-    let height = (modal.reasons.len() as u16 + 5).min(area.height.saturating_sub(4));
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let popup = Rect::new(x, y, width, height);
-
-    frame.render_widget(Clear, popup);
-    let (title, color, hint) = if modal.blocking {
-        (
-            "AUDIT: BLOCKED",
-            theme::BLOCK,
-            "f = force through (logged)   Esc = cancel",
-        )
+/// If `path` is a `.png` QR export of a shard, decode it and stage the
+/// payload to a fresh temp `.hx` file, pushing that temp path onto
+/// `temp_files` for later cleanup. Otherwise returns `path` unchanged.
+fn stage_shard_path(path: &std::path::Path, temp_files: &mut Vec<PathBuf>) -> Result<PathBuf, Error> {
+    if path.extension().is_some_and(|e| e == "png") {
+        let staged = horcrux::qr::stage_shard_from_qr_png(path)?;
+        temp_files.push(staged.clone());
+        Ok(staged)
     } else {
-        (
-            "AUDIT: WARNING",
-            theme::WARN,
-            "Enter = continue   Esc = cancel",
-        )
-    };
-    let mut lines: Vec<ListItem> = modal
-        .reasons
-        .iter()
-        .map(|r| ListItem::new(format!("• {r}")))
-        .collect();
-    lines.push(ListItem::new(""));
-    lines.push(ListItem::new(hint).style(Style::default().fg(theme::MUTED)));
-    frame.render_widget(
-        List::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .border_style(Style::default().fg(color)),
-        ),
-        popup,
-    );
+        Ok(path.to_path_buf())
+    }
+}
+
+/// Best-effort removal of temp files staged by [`stage_shard_path`].
+fn cleanup_temp_files(paths: &[PathBuf]) {
+    for p in paths {
+        let _ = std::fs::remove_file(p);
+    }
 }

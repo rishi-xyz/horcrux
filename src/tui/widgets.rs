@@ -10,7 +10,7 @@ use crossterm::event::{Event, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use tui_input::Input;
 use tui_input::backend::crossterm::to_input_request;
 
@@ -67,8 +67,9 @@ impl TextField {
     }
 }
 
-/// A directory path plus a checkbox list of `.hx` shard/share files found in
-/// it, for selecting which files to combine for a reconstruction/signing
+/// A directory path plus a checkbox list of `.hx` shard/share files — or a
+/// `.png` QR export of one (see `crate::qr::write_shard_qr`) — found in it,
+/// for selecting which files to combine for a reconstruction/signing
 /// attempt.
 #[derive(Default)]
 pub struct FileChecklist {
@@ -79,7 +80,8 @@ pub struct FileChecklist {
 }
 
 impl FileChecklist {
-    /// Re-scan `dir` for `.hx` files, resetting all checkboxes.
+    /// Re-scan `dir` for `.hx` shard/share files and `.png` QR exports of
+    /// one, resetting all checkboxes.
     pub fn rescan(&mut self) {
         let dir = std::path::PathBuf::from(self.dir.value());
         let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
@@ -87,7 +89,7 @@ impl FileChecklist {
             .flatten()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "hx"))
+            .filter(|p| p.extension().is_some_and(|e| e == "hx" || e == "png"))
             .collect();
         entries.sort();
         self.checked = vec![false; entries.len()];
@@ -132,6 +134,11 @@ impl FileChecklist {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                let name = if p.extension().is_some_and(|e| e == "png") {
+                    format!("[QR] {name}")
+                } else {
+                    name
+                };
                 let style = if focused && i == self.cursor {
                     Style::default().add_modifier(Modifier::REVERSED)
                 } else {
@@ -157,6 +164,58 @@ impl FileChecklist {
             .border_style(border_style);
         frame.render_widget(List::new(items).block(block), area);
     }
+}
+
+/// Render the shared audit Block/Warn modal, used identically by the Sign
+/// and MPC (sign side) screens. Restates the consequence of each choice and
+/// repeats the key hint above and below the reasons list, so it survives a
+/// small terminal or a distracted skim — the modal is the one place a user
+/// unfamiliar with the audit gate is most likely to get stuck.
+pub fn render_audit_modal(frame: &mut Frame, area: Rect, blocking: bool, reasons: &[String]) {
+    let width = area.width.saturating_sub(8).clamp(20, 70);
+    let height = (reasons.len() as u16 + 9).min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, popup);
+    let (title, color, banner, consequence, hint) = if blocking {
+        (
+            "AUDIT: BLOCKED",
+            theme::BLOCK,
+            "\u{26a0} AUDIT BLOCKED \u{2014} signing refused",
+            "This attempt is already logged; forcing through logs it again as forced.",
+            "f = force through (logged)   Esc = cancel",
+        )
+    } else {
+        (
+            "AUDIT: WARNING",
+            theme::WARN,
+            "\u{26a0} AUDIT WARNING \u{2014} review before continuing",
+            "Continuing proceeds immediately; nothing is blocked.",
+            "Enter = continue   Esc = cancel",
+        )
+    };
+
+    let mut lines: Vec<ListItem> = vec![
+        ListItem::new(banner).style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        ListItem::new(hint).style(Style::default().fg(theme::MUTED)),
+        ListItem::new(""),
+    ];
+    lines.extend(reasons.iter().map(|r| ListItem::new(format!("\u{2022} {r}"))));
+    lines.push(ListItem::new(""));
+    lines.push(ListItem::new(consequence).style(Style::default().fg(theme::MUTED)));
+    lines.push(ListItem::new(hint).style(Style::default().fg(theme::MUTED)));
+
+    frame.render_widget(
+        List::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(color)),
+        ),
+        popup,
+    );
 }
 
 #[cfg(test)]

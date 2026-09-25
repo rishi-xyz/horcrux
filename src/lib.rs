@@ -13,6 +13,7 @@ pub mod btc_mpc;
 pub mod chain;
 pub mod cosmos;
 pub mod crypto;
+pub mod device;
 pub mod error;
 pub mod mpc;
 pub mod qr;
@@ -62,6 +63,52 @@ pub fn init_shards(
     out_dir: &Path,
     passwords: &[String],
 ) -> Result<Vec<PathBuf>, Error> {
+    fs::create_dir_all(out_dir)?;
+    build_shards(key, threshold, share_count, passwords, |id, _i| {
+        out_dir.join(format!("shard-{id}.hx"))
+    })
+}
+
+/// Split a private key exactly like [`init_shards`], but write each
+/// guardian's shard to its own destination path (e.g. a detected removable
+/// drive, or a QR/custom path) instead of one shared directory.
+/// `destinations[i]` receives the same guardian's shard as `passwords[i]`
+/// (matched by position, same as `init_shards` matches `passwords[i]` to the
+/// `i`-th share produced by the split — not by the share's on-disk id).
+pub fn init_shards_to(
+    key: &SecretKey,
+    threshold: u8,
+    share_count: u8,
+    passwords: &[String],
+    destinations: &[PathBuf],
+) -> Result<Vec<PathBuf>, Error> {
+    if destinations.len() != share_count as usize {
+        return Err(Error::InvalidParams(format!(
+            "expected {share_count} destinations, got {}",
+            destinations.len()
+        )));
+    }
+    for dest in destinations {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    build_shards(key, threshold, share_count, passwords, |_id, i| {
+        destinations[i].clone()
+    })
+}
+
+/// Shared split+encrypt+write body for [`init_shards`]/[`init_shards_to`].
+/// `path_for(id, index)` resolves each share's output path from its assigned
+/// share id (for the `shard-{id}.hx` naming convention) and its position in
+/// the split order (for matching a per-guardian destination/password list).
+fn build_shards(
+    key: &SecretKey,
+    threshold: u8,
+    share_count: u8,
+    passwords: &[String],
+    path_for: impl Fn(u8, usize) -> PathBuf,
+) -> Result<Vec<PathBuf>, Error> {
     if threshold == 0 || threshold > share_count {
         return Err(Error::InvalidParams(format!(
             "threshold ({threshold}) must be between 1 and share count ({share_count})"
@@ -75,7 +122,6 @@ pub fn init_shards(
     }
 
     let shares = sss::split(key, threshold as usize, share_count as usize)?;
-    fs::create_dir_all(out_dir)?;
 
     let mut paths = Vec::with_capacity(shares.len());
     for (i, share) in shares.iter().enumerate() {
@@ -92,7 +138,7 @@ pub fn init_shards(
         sealed_arr.copy_from_slice(&sealed);
 
         let shard = Shard::new(threshold, share_count, id, salt, nonce, sealed_arr);
-        let path = out_dir.join(format!("shard-{id}.hx"));
+        let path = path_for(id, i);
         shard.write(&path)?;
         paths.push(path);
     }

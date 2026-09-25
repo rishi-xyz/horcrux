@@ -119,6 +119,8 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
         .route("/sign", post(handlers::sign))
         .route("/mpc-split", post(handlers::mpc_split))
         .route("/mpc-sign", post(handlers::mpc_sign))
+        .route("/shard-qr", post(handlers::shard_qr))
+        .route("/shard-qr-import", post(handlers::shard_qr_import))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state.clone());
 

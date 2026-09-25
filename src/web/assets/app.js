@@ -85,19 +85,100 @@
     return wrap;
   }
 
+  // ===== QR: show a written shard/share as a scannable code, and import one =====
+  // Reuses the same HX3 QR transport the TUI and CLI already use
+  // (src/qr.rs) via the /api/shard-qr and /api/shard-qr-import endpoints —
+  // no new crypto here, just base64 PNG frames over the existing token-gated API.
+
+  function qrShowButton(path) {
+    const wrap = el("div", { style: "margin-top:6px" });
+    const btn = el("button", { class: "btn btn-outline", type: "button" }, ["Show as QR"]);
+    const frames = el("div", { class: "qr-frames" });
+    btn.addEventListener("click", async () => {
+      clear(frames);
+      btn.disabled = true;
+      try {
+        const res = await api("/shard-qr", { method: "POST", body: { path } });
+        res.frames.forEach((b64, i) => {
+          const cell = el("div", { class: "qr-frame" });
+          cell.appendChild(el("img", { src: "data:image/png;base64," + b64, alt: "QR frame " + (i + 1) }));
+          if (res.frames.length > 1) {
+            cell.appendChild(el("p", { class: "qr-frame-label" }, ["frame " + (i + 1) + "/" + res.frames.length]));
+          }
+          frames.appendChild(cell);
+        });
+      } catch (e) {
+        clear(frames);
+        frames.appendChild(banner("error", e.message));
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    wrap.appendChild(btn);
+    wrap.appendChild(frames);
+    return wrap;
+  }
+
+  function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result).split(",").pop());
+      reader.onerror = () => reject(reader.error || new Error("failed to read file"));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  /// Wires an "Import from QR" file input + button onto `textareaName`
+  /// (the `shards`/`shares` field) within `form`, appending each imported
+  /// temp path as a new line.
+  function wireQrImport(form, textareaName, inputId, buttonId) {
+    const input = form.querySelector("#" + inputId);
+    const button = form.querySelector("#" + buttonId);
+    const textarea = form.querySelector('[name="' + textareaName + '"]');
+    if (!input || !button || !textarea) return;
+    button.addEventListener("click", async () => {
+      const files = Array.from(input.files || []);
+      if (!files.length) return;
+      button.disabled = true;
+      try {
+        for (const file of files) {
+          const png_base64 = await fileToBase64(file);
+          const res = await api("/shard-qr-import", { method: "POST", body: { png_base64 } });
+          const sep = textarea.value && !textarea.value.endsWith("\n") ? "\n" : "";
+          textarea.value += sep + res.path;
+        }
+        input.value = "";
+      } catch (e) {
+        alert("QR import failed: " + e.message);
+      } finally {
+        button.disabled = false;
+      }
+    });
+  }
+
   // ===== Section switching =====
+  // Section and MPC-sub-tab changes push a URL hash (e.g. "#mpc/sign") via
+  // history.pushState, and a popstate listener re-derives the active
+  // section/tab from location.hash. This makes the browser Back/Forward
+  // buttons work as real in-app navigation and makes every section
+  // deep-linkable, instead of navigating away from the app entirely (which
+  // previously dropped the ?token= query param). location.search — and so
+  // ?token= — is untouched by every hash change below.
+  const VALID_SECTIONS = ["log", "verify", "init", "sign", "mpc"];
   const railItems = document.querySelectorAll(".rail-item");
   const sections = document.querySelectorAll("[data-section]");
-  railItems.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      railItems.forEach((b) => b.classList.remove("is-active"));
-      btn.classList.add("is-active");
-      const target = btn.dataset.section;
-      sections.forEach((s) => {
-        s.hidden = s.id !== "section-" + target;
-      });
-      if (target === "log") loadLog();
+
+  function activateSection(name, opts) {
+    const push = !opts || opts.push !== false;
+    railItems.forEach((b) => b.classList.toggle("is-active", b.dataset.section === name));
+    sections.forEach((s) => {
+      s.hidden = s.id !== "section-" + name;
     });
+    if (name === "log") loadLog();
+    if (push) history.pushState(null, "", "#" + name);
+  }
+  railItems.forEach((btn) => {
+    btn.addEventListener("click", () => activateSection(btn.dataset.section));
   });
 
   // ===== Access log =====
@@ -143,7 +224,6 @@
     }
   }
   document.getElementById("logReload").addEventListener("click", loadLog);
-  loadLog();
 
   // ===== Helpers shared by forms =====
   function lines(value) {
@@ -250,7 +330,13 @@
         result.appendChild(b);
       }
       result.appendChild(banner("ok", "Wrote " + res.paths.length + " shard(s) to " + res.out_dir));
-      result.appendChild(el("ul", { class: "file-list" }, res.paths.map((p) => el("li", {}, [p]))));
+      result.appendChild(
+        el(
+          "ul",
+          { class: "file-list" },
+          res.paths.map((p) => el("li", {}, [p, qrShowButton(p)]))
+        )
+      );
     } catch (e) {
       clear(result);
       result.appendChild(banner("error", e.message));
@@ -261,6 +347,7 @@
 
   // ===== Sign =====
   const signForm = document.getElementById("signForm");
+  wireQrImport(signForm, "shards", "qrImportInputSign", "qrImportBtnSign");
   signForm.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     const result = document.getElementById("signResult");
@@ -302,14 +389,16 @@
   // ===== MPC (Split / Sign tabs) =====
   const mpcTabs = document.querySelectorAll("[data-mpc-tab].tab");
   const mpcForms = document.querySelectorAll("form.mpc-tab");
+
+  function activateMpcTab(which, opts) {
+    const push = !opts || opts.push !== false;
+    mpcTabs.forEach((t) => t.classList.toggle("is-active", t.dataset.mpcTab === which));
+    mpcForms.forEach((f) => (f.hidden = f.dataset.mpcTab !== which));
+    clear(document.getElementById("mpcResult"));
+    if (push) history.pushState(null, "", "#mpc/" + which);
+  }
   mpcTabs.forEach((tab) => {
-    tab.addEventListener("click", () => {
-      mpcTabs.forEach((t) => t.classList.remove("is-active"));
-      tab.classList.add("is-active");
-      const which = tab.dataset.mpcTab;
-      mpcForms.forEach((f) => (f.hidden = f.dataset.mpcTab !== which));
-      clear(document.getElementById("mpcResult"));
-    });
+    tab.addEventListener("click", () => activateMpcTab(tab.dataset.mpcTab));
   });
 
   document.getElementById("mpcSplitForm").addEventListener("submit", async (ev) => {
@@ -338,7 +427,13 @@
         result.appendChild(b);
       }
       result.appendChild(banner("ok", "Wrote " + res.paths.length + " key share(s). Group package: " + res.group_path));
-      result.appendChild(el("ul", { class: "file-list" }, res.paths.map((p) => el("li", {}, [p]))));
+      result.appendChild(
+        el(
+          "ul",
+          { class: "file-list" },
+          res.paths.map((p) => el("li", {}, [p, qrShowButton(p)]))
+        )
+      );
     } catch (e) {
       clear(result);
       result.appendChild(banner("error", e.message));
@@ -347,7 +442,9 @@
     }
   });
 
-  document.getElementById("mpcSignForm").addEventListener("submit", async (ev) => {
+  const mpcSignForm = document.getElementById("mpcSignForm");
+  wireQrImport(mpcSignForm, "shares", "qrImportInputMpcSign", "qrImportBtnMpcSign");
+  mpcSignForm.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     const form = ev.target;
     const result = document.getElementById("mpcResult");
@@ -386,4 +483,19 @@
       setBusy(form, false);
     }
   });
+
+  // ===== Hash router =====
+  function applyHashRoute(push) {
+    const [rawSection, subtab] = (location.hash.slice(1) || "log").split("/");
+    const section = VALID_SECTIONS.includes(rawSection) ? rawSection : "log";
+    activateSection(section, { push });
+    if (section === "mpc" && (subtab === "split" || subtab === "sign")) {
+      activateMpcTab(subtab, { push });
+    }
+  }
+  window.addEventListener("popstate", () => applyHashRoute(false));
+  const backBtn = document.getElementById("backBtn");
+  if (backBtn) backBtn.addEventListener("click", () => history.back());
+
+  applyHashRoute(false);
 })();

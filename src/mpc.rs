@@ -176,6 +176,64 @@ pub fn mpc_split(
     out_dir: &Path,
     passwords: &[String],
 ) -> Result<(Vec<PathBuf>, PathBuf), Error> {
+    fs::create_dir_all(out_dir)?;
+    let (paths, group_bytes) = build_frost_shares(key, threshold, share_count, passwords, |id, _i| {
+        out_dir.join(format!("mpc-{id}.hx"))
+    })?;
+    let group_path = out_dir.join(GROUP_PUB_FILENAME);
+    fs::write(&group_path, group_bytes).map_err(Error::Io)?;
+    Ok((paths, group_path))
+}
+
+/// Dealer-split `key` exactly like [`mpc_split`], but write each guardian's
+/// share to its own destination path (e.g. a detected removable drive)
+/// instead of one shared directory. `share_destinations[i]` receives the
+/// same guardian's share as `passwords[i]` (matched by position, same
+/// convention as `mpc_split`'s `passwords[i]`). The group public key package
+/// — not a secret, but needed by every future signer — is always written to
+/// the coordinator's own `group_out_dir`, independent of the per-share
+/// destinations.
+pub fn mpc_split_to(
+    key: &k256::SecretKey,
+    threshold: u8,
+    share_count: u8,
+    passwords: &[String],
+    share_destinations: &[PathBuf],
+    group_out_dir: &Path,
+) -> Result<(Vec<PathBuf>, PathBuf), Error> {
+    if share_destinations.len() != share_count as usize {
+        return Err(Error::InvalidParams(format!(
+            "expected {share_count} destinations, got {}",
+            share_destinations.len()
+        )));
+    }
+    for dest in share_destinations {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::create_dir_all(group_out_dir)?;
+    let (paths, group_bytes) = build_frost_shares(key, threshold, share_count, passwords, |_id, i| {
+        share_destinations[i].clone()
+    })?;
+    let group_path = group_out_dir.join(GROUP_PUB_FILENAME);
+    fs::write(&group_path, group_bytes).map_err(Error::Io)?;
+    Ok((paths, group_path))
+}
+
+/// Shared dealer-split+encrypt+write body for [`mpc_split`]/[`mpc_split_to`].
+/// `path_for(id, index)` resolves each share's output path from its assigned
+/// participant id (for the `mpc-{id}.hx` naming convention) and its position
+/// in the split order (for matching a per-guardian destination/password
+/// list). Returns the written share paths and the serialized group public
+/// key package (the caller decides where to write it).
+fn build_frost_shares(
+    key: &k256::SecretKey,
+    threshold: u8,
+    share_count: u8,
+    passwords: &[String],
+    path_for: impl Fn(u8, usize) -> PathBuf,
+) -> Result<(Vec<PathBuf>, Vec<u8>), Error> {
     if threshold < 2 {
         return Err(Error::InvalidParams(
             "FROST requires a threshold of at least 2".to_string(),
@@ -206,8 +264,6 @@ pub fn mpc_split(
     )
     .map_err(|e| Error::Mpc(e.to_string()))?;
 
-    fs::create_dir_all(out_dir)?;
-
     let mut paths = Vec::with_capacity(secret_shares.len());
     for (i, (identifier, secret_share)) in secret_shares.iter().enumerate() {
         let id = share_id(identifier);
@@ -229,18 +285,16 @@ pub fn mpc_split(
             nonce,
             sealed,
         };
-        let path = out_dir.join(format!("mpc-{id}.hx"));
+        let path = path_for(id, i);
         share.write(&path)?;
         paths.push(path);
     }
 
-    let group_path = out_dir.join(GROUP_PUB_FILENAME);
     let group_bytes = pubkey_package
         .serialize()
         .map_err(|e| Error::Mpc(e.to_string()))?;
-    fs::write(&group_path, group_bytes).map_err(Error::Io)?;
 
-    Ok((paths, group_path))
+    Ok((paths, group_bytes))
 }
 
 /// Read the participant ids from FROST share files without decrypting
