@@ -23,7 +23,6 @@
 }
 
 * { box-sizing: border-box; }
-[hidden] { display: none !important; }
 body {
   margin: 0;
   background: var(--bg);
@@ -31,7 +30,7 @@ body {
   font-family: var(--font-sans);
   line-height: 1.5;
 }
-code, pre, input, textarea, button { font-family: inherit; }
+code, pre, input, textarea, button, select { font-family: inherit; }
 button { font-family: var(--font-sans); }
 
 .shell { display: flex; min-height: 100vh; }
@@ -65,6 +64,7 @@ button { font-family: var(--font-sans); }
   cursor: pointer;
   font-size: 0.92rem;
   font-weight: 500;
+  text-decoration: none;
 }
 .rail-item em { font-style: normal; font-size: 0.72rem; color: var(--text-faint); margin-left: auto; }
 .rail-item:hover { background: rgba(255,255,255,0.03); color: var(--text); }
@@ -98,6 +98,7 @@ button { font-family: var(--font-sans); }
 .field input[type="text"],
 .field input[type="password"],
 .field input[type="number"],
+.field select,
 .field textarea {
   background: var(--surface);
   border: 1px solid var(--border-strong);
@@ -108,7 +109,7 @@ button { font-family: var(--font-sans); }
   font-family: var(--font-mono);
 }
 .field textarea { resize: vertical; }
-.field input:focus, .field textarea:focus {
+.field input:focus, .field textarea:focus, .field select:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
@@ -198,12 +199,78 @@ table.data tr:last-child td { border-bottom: none; }
 }
 .copy-inline:hover { color: var(--accent); border-color: var(--accent); }
 
-.qr-import-row { align-items: center; gap: 10px; margin-top: -6px; }
+.qr-import-row { align-items: center; gap: 10px; margin-top: -6px; flex-wrap: wrap; }
 .qr-import-row input[type="file"] { font-size: 0.8rem; color: var(--text-muted); }
 .qr-frames { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; }
 .qr-frame { display: flex; flex-direction: column; align-items: center; gap: 4px; }
 .qr-frame img { width: 180px; height: 180px; background: #fff; border-radius: 6px; }
 .qr-frame-label { font-size: 0.72rem; color: var(--text-muted); }
+
+/* ===== Per-guardian destination + password rows (Init, Sign, MPC) ===== */
+.guardian-list-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.btn-inline {
+  border: 1px solid var(--border-strong); background: rgba(255,255,255,0.02); color: var(--text-muted);
+  border-radius: 999px; padding: 3px 10px; font-size: 0.72rem; cursor: pointer;
+}
+.btn-inline:hover { color: var(--accent); border-color: var(--accent); }
+.guardian-list { display: flex; flex-direction: column; gap: 8px; }
+.guardian-list-empty { color: var(--text-faint); font-size: 0.8rem; }
+.guardian-row {
+  display: grid;
+  grid-template-columns: 90px 1fr 1fr;
+  gap: 8px;
+  align-items: center;
+}
+.guardian-row.guardian-row-simple { grid-template-columns: 1fr 1fr; }
+.guardian-label { font-size: 0.78rem; color: var(--text-muted); font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.guardian-row select.guardian-dest,
+.guardian-row input.guardian-custom-path,
+.guardian-row input.guardian-password {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  color: var(--text);
+  font-size: 0.86rem;
+  font-family: var(--font-mono);
+  width: 100%;
+}
+.guardian-row select.guardian-dest:focus,
+.guardian-row input.guardian-custom-path:focus,
+.guardian-row input.guardian-password:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* ===== Audit modal ===== */
+.modal-backdrop {
+  position: fixed; inset: 0; background: rgba(2,4,7,0.7);
+  display: flex; align-items: center; justify-content: center; z-index: 50;
+}
+.modal-card {
+  background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius);
+  padding: 22px 24px; max-width: 440px; width: 90%;
+}
+.modal-card.is-blocking { border-color: rgba(244,99,111,0.4); }
+.modal-card.is-warning { border-color: rgba(245,176,67,0.4); }
+.modal-banner { font-weight: 700; font-size: 0.98rem; margin-bottom: 8px; }
+.modal-banner.is-blocking { color: var(--danger); }
+.modal-banner.is-warning { color: var(--warn); }
+.modal-reasons { margin: 10px 0; padding-left: 18px; color: var(--text-muted); font-size: 0.86rem; }
+.modal-consequence { color: var(--text-faint); font-size: 0.8rem; margin-bottom: 16px; }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+
+/* ===== Webcam QR scanner ===== */
+.scanner-wrap {
+  border: 1px solid var(--border-strong); border-radius: var(--radius); overflow: hidden;
+  background: #000; position: relative; width: 100%; max-width: 360px; margin-top: 10px;
+}
+.scanner-wrap video { width: 100%; display: block; }
+.scanner-hint {
+  position: absolute; bottom: 0; left: 0; right: 0; padding: 8px 10px;
+  background: rgba(0,0,0,0.55); color: var(--text); font-size: 0.76rem; text-align: center;
+}
 
 @media (max-width: 860px) {
   .shell { flex-direction: column; }

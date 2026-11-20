@@ -456,9 +456,33 @@ impl InitScreen {
             }
             guardian_rows.push(Focus::Password(i));
         }
-        let field_rows = 5 + guardian_rows.len();
-        let mut constraints = vec![Constraint::Length(3); field_rows];
-        constraints.push(Constraint::Min(0));
+
+        // Only as many guardian rows as fit are laid out; the visible
+        // window follows whichever row is focused, so a large `shares`
+        // count scrolls instead of the tail of the list being rendered
+        // off-screen and unreachable.
+        let fixed_top_height: u16 = 5 * 3; // Generate,KeyHex,Threshold,Shares,OutDir
+        let scroll_hint_height: u16 = 1;
+        let min_result_height: u16 = 3;
+        let capacity = (area
+            .height
+            .saturating_sub(fixed_top_height + scroll_hint_height + min_result_height)
+            / 3) as usize;
+        let focused_row = guardian_rows
+            .iter()
+            .position(|f| *f == self.focus)
+            .unwrap_or(0);
+        let (start, end) =
+            crate::tui::widgets::scroll_window(guardian_rows.len(), focused_row, capacity);
+        let visible_rows = &guardian_rows[start..end];
+
+        let mut constraints = vec![Constraint::Length(3); 5];
+        constraints.push(Constraint::Length(1)); // scroll hint
+        constraints.extend(std::iter::repeat_n(
+            Constraint::Length(3),
+            visible_rows.len(),
+        ));
+        constraints.push(Constraint::Min(0)); // result
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
@@ -502,8 +526,22 @@ impl InitScreen {
             self.focus == Focus::OutDir,
         );
         let n = self.passwords.len();
-        for (row_offset, row) in guardian_rows.iter().enumerate() {
-            let area = chunks[5 + row_offset];
+        let scroll_hint = if guardian_rows.len() > visible_rows.len() {
+            format!(
+                "guardian rows {}-{} of {} — Tab/Shift+Tab to scroll",
+                start + 1,
+                end,
+                guardian_rows.len()
+            )
+        } else {
+            String::new()
+        };
+        frame.render_widget(
+            Paragraph::new(scroll_hint).style(Style::default().fg(theme::MUTED)),
+            chunks[5],
+        );
+        for (row_offset, row) in visible_rows.iter().enumerate() {
+            let area = chunks[6 + row_offset];
             match *row {
                 Focus::Dest(i) => {
                     let label = format!(
@@ -587,7 +625,7 @@ impl InitScreen {
         };
         frame.render_widget(
             List::new(items).block(Block::default().borders(Borders::ALL).title("result")),
-            chunks[field_rows],
+            chunks[6 + visible_rows.len()],
         );
 
         if let Some(overlay) = &self.qr_view {
@@ -649,6 +687,42 @@ fn parse_key(hex_key: &str) -> Result<SecretKey, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// Many guardians (more rows than a small terminal can show at once)
+    /// must scroll instead of panicking or silently dropping the trailing
+    /// fields off-screen with no way to reach them.
+    #[test]
+    fn render_with_many_guardians_in_a_small_terminal_does_not_panic_and_shows_scroll_hint() {
+        let mut screen = InitScreen::default();
+        screen.shares.set_value("20");
+        screen.sync_guardians();
+        assert_eq!(screen.passwords.len(), 20);
+
+        let backend = TestBackend::new(60, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| screen.render(frame, frame.area()))
+            .expect("draw must not panic");
+
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(
+            rendered.contains("to scroll"),
+            "expected a scroll hint to be visible"
+        );
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let area = buffer.area();
+        let mut out = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+        }
+        out
+    }
 
     #[test]
     #[allow(clippy::field_reassign_with_default)]

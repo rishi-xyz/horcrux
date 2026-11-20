@@ -1,0 +1,45 @@
+services:
+  horcrux:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: horcrux:local
+    pull_policy: build
+    container_name: horcrux-web
+    ports:
+      - "7420:7420"
+    environment:
+      HORCRUX_WEB_HOST: 0.0.0.0
+      HORCRUX_RPC_URL: http://solana:8899
+      HORCRUX_WEB_DATA_DIR: /data
+      HORCRUX_ACCESS_LOG: /data/horcrux-access.log
+      # Optional: set these if you want advisory AI checks in-container
+      # OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      # HORCRUX_AI_MODEL: ${HORCRUX_AI_MODEL:-meta-llama/llama-3.3-70b-instruct:free}
+    volumes:
+      - ./data:/data
+    working_dir: /data
+    depends_on:
+      solana:
+        condition: service_started
+    restart: unless-stopped
+
+  solana:
+    image: solanalabs/solana:v1.18.26
+    container_name: horcrux-solana-localnet
+    command: >
+      solana-test-validator
+      --reset
+      --bind-address 0.0.0.0
+      --rpc-bind-address 0.0.0.0
+      --ledger /ledger
+      --quiet
+    ports:
+      - "8899:8899"
+      - "8900:8900"
+    volumes:
+      - solana-ledger:/ledger
+    restart: unless-stopped
+
+volumes:
+  solana-ledger:

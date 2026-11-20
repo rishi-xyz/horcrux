@@ -3,3 +3,16 @@
 /test-ledger
 /horcrux-access.log
 .env
+/web-ui/node_modules
+/web-ui/dist
+/web/node_modules
+/web/.next
+/web/out
+/.local-devnet
+/horcrux-wallets.json
+/horcrux-ai-events.jsonl
+/horcrux-web-state.json
+/mpc
+/output-shards
+/qr
+*.qr-nonce

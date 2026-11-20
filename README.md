@@ -591,6 +591,17 @@ cd horcrux
 
 ## Build
 
+The web UI (`web-ui/`, a Vite + React app) is embedded into the binary at
+compile time, so it must be built once before `cargo build`/`cargo run`:
+
+```bash
+cd web-ui && npm install && npm run build && cd ..
+```
+
+Re-run that whenever you change anything under `web-ui/src`. `cargo build`
+fails fast with a clear error ("is not a directory") if `web-ui/dist`
+doesn't exist yet.
+
 Development
 
 ```bash

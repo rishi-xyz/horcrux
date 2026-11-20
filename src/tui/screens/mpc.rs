@@ -485,7 +485,11 @@ impl MpcScreen {
             Focus::GroupDir => self.group_dir.handle_key(key),
             Focus::ShareDir => {
                 if key.code == KeyCode::Enter {
-                    self.picker.rescan();
+                    // Adds this directory's files to whatever is already
+                    // listed (see `SignScreen`'s equivalent) so shares
+                    // spread across several guardians' USB drives can be
+                    // combined instead of being limited to one directory.
+                    self.picker.scan_add();
                     self.sync_sign_passwords();
                 } else {
                     self.picker.dir.handle_key(key);
@@ -498,6 +502,7 @@ impl MpcScreen {
                     self.picker.toggle();
                     self.sync_sign_passwords();
                 }
+                KeyCode::Char('c') | KeyCode::Char('C') => self.picker.clear(),
                 _ => {}
             },
             Focus::SignPassword(i) => {
@@ -932,9 +937,32 @@ impl MpcScreen {
             }
             guardian_rows.push(Focus::SplitPassword(i));
         }
-        let field_rows = 5 + guardian_rows.len();
-        let mut constraints = vec![Constraint::Length(3); field_rows];
-        constraints.push(Constraint::Min(0));
+
+        // See `InitScreen::render` for why this window exists: without it,
+        // a large `shares` count would push later guardian rows off-screen
+        // with no way to scroll to them.
+        let fixed_top_height: u16 = 5 * 3;
+        let scroll_hint_height: u16 = 1;
+        let min_result_height: u16 = 3;
+        let capacity = (area
+            .height
+            .saturating_sub(fixed_top_height + scroll_hint_height + min_result_height)
+            / 3) as usize;
+        let focused_row = guardian_rows
+            .iter()
+            .position(|f| *f == self.focus)
+            .unwrap_or(0);
+        let (start, end) =
+            crate::tui::widgets::scroll_window(guardian_rows.len(), focused_row, capacity);
+        let visible_rows = &guardian_rows[start..end];
+
+        let mut constraints = vec![Constraint::Length(3); 5];
+        constraints.push(Constraint::Length(1)); // scroll hint
+        constraints.extend(std::iter::repeat_n(
+            Constraint::Length(3),
+            visible_rows.len(),
+        ));
+        constraints.push(Constraint::Min(0)); // result
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
@@ -972,8 +1000,22 @@ impl MpcScreen {
             self.focus == Focus::SplitOutDir,
         );
         let n = self.split_passwords.len();
-        for (row_offset, row) in guardian_rows.iter().enumerate() {
-            let row_area = chunks[5 + row_offset];
+        let scroll_hint = if guardian_rows.len() > visible_rows.len() {
+            format!(
+                "guardian rows {}-{} of {} — Tab/Shift+Tab to scroll",
+                start + 1,
+                end,
+                guardian_rows.len()
+            )
+        } else {
+            String::new()
+        };
+        frame.render_widget(
+            Paragraph::new(scroll_hint).style(Style::default().fg(theme::MUTED)),
+            chunks[5],
+        );
+        for (row_offset, row) in visible_rows.iter().enumerate() {
+            let row_area = chunks[6 + row_offset];
             match *row {
                 Focus::SplitDest(i) => {
                     let label = format!(
@@ -1054,19 +1096,31 @@ impl MpcScreen {
         }
         frame.render_widget(
             List::new(items).block(Block::default().borders(Borders::ALL).title("result")),
-            chunks[field_rows],
+            chunks[6 + visible_rows.len()],
         );
     }
 
     fn render_sign(&self, frame: &mut Frame, area: Rect) {
         let selected = self.picker.selected();
         let n = selected.len();
+
+        // See `SignScreen::render` for why this window exists.
+        let fixed_rows_height: u16 = 3 + 3 + 6 + 1 + 3 + 3 + 3 + 1 + 3;
+        let capacity = (area.height.saturating_sub(fixed_rows_height + 3) / 3) as usize;
+        let focused_index = match self.focus {
+            Focus::SignPassword(i) => i,
+            _ => 0,
+        };
+        let (start, end) = crate::tui::widgets::scroll_window(n, focused_index, capacity);
+        let visible = &selected[start..end];
+
         let mut constraints = vec![
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(6),
+            Constraint::Length(1), // scroll hint
         ];
-        constraints.extend(std::iter::repeat_n(Constraint::Length(3), n));
+        constraints.extend(std::iter::repeat_n(Constraint::Length(3), visible.len()));
         constraints.extend([
             Constraint::Length(3), // To
             Constraint::Length(3), // Lamports
@@ -1089,12 +1143,26 @@ impl MpcScreen {
         self.picker.dir.render(
             frame,
             chunks[1],
-            "share directory (Enter to scan)",
+            "share directory (Enter adds its files — repeat per guardian's drive)",
             self.focus == Focus::ShareDir,
         );
         self.picker
             .render(frame, chunks[2], self.focus == Focus::Files);
-        for (i, path) in selected.iter().enumerate() {
+        let scroll_hint = if n > visible.len() {
+            format!(
+                "password rows {}-{} of {n} — Tab/Shift+Tab to scroll",
+                start + 1,
+                end
+            )
+        } else {
+            String::new()
+        };
+        frame.render_widget(
+            Paragraph::new(scroll_hint).style(Style::default().fg(theme::MUTED)),
+            chunks[3],
+        );
+        for (row_offset, path) in visible.iter().enumerate() {
+            let i = start + row_offset;
             let label = format!(
                 "password for {} (distinct per guardian)",
                 path.file_name()
@@ -1104,13 +1172,13 @@ impl MpcScreen {
             if let Some(field) = self.password_by_path.get(path) {
                 field.render(
                     frame,
-                    chunks[3 + i],
+                    chunks[4 + row_offset],
                     &label,
                     self.focus == Focus::SignPassword(i),
                 );
             }
         }
-        let to_idx = 3 + n;
+        let to_idx = 4 + visible.len();
         self.to.render(
             frame,
             chunks[to_idx],
@@ -1285,6 +1353,24 @@ fn parse_key(hex_key: &str) -> Result<SecretKey, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// See `screens::init`'s equivalent: many guardians must scroll instead
+    /// of panicking or being rendered unreachably off-screen.
+    #[test]
+    fn render_split_with_many_guardians_in_a_small_terminal_does_not_panic() {
+        let mut screen = MpcScreen::default();
+        screen.shares_count.set_value("20");
+        screen.sync_split_guardians();
+        assert_eq!(screen.split_passwords.len(), 20);
+
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| screen.render(frame, frame.area()))
+            .expect("draw must not panic");
+    }
 
     #[test]
     #[allow(clippy::field_reassign_with_default)]

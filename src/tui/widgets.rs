@@ -10,7 +10,7 @@ use crossterm::event::{Event, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use tui_input::Input;
 use tui_input::backend::crossterm::to_input_request;
 
@@ -80,20 +80,27 @@ pub struct FileChecklist {
 }
 
 impl FileChecklist {
-    /// Re-scan `dir` for `.hx` shard/share files and `.png` QR exports of
-    /// one, resetting all checkboxes.
-    pub fn rescan(&mut self) {
-        let dir = std::path::PathBuf::from(self.dir.value());
-        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+    /// Scan `dir` and add any files not already in the list, preserving
+    /// existing entries and their checkbox/password state. Call this once
+    /// per guardian's directory (typing a new path into `dir` and pressing
+    /// Enter each time) to build a combined selection across several USB
+    /// drives instead of being limited to one directory at a time.
+    pub fn scan_add(&mut self) {
+        let mut new_entries: Vec<std::path::PathBuf> = scan_dir(self.dir.value())
             .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "hx" || e == "png"))
+            .filter(|p| !self.files.contains(p))
             .collect();
-        entries.sort();
-        self.checked = vec![false; entries.len()];
-        self.files = entries;
+        new_entries.sort();
+        self.checked
+            .extend(std::iter::repeat_n(false, new_entries.len()));
+        self.files.extend(new_entries);
+    }
+
+    /// Empty the list entirely (e.g. to start a fresh multi-drive selection
+    /// from scratch).
+    pub fn clear(&mut self) {
+        self.files.clear();
+        self.checked.clear();
         self.cursor = 0;
     }
 
@@ -122,13 +129,18 @@ impl FileChecklist {
         }
     }
 
+    /// Render the checklist. Uses a stateful `List` (rather than a plain
+    /// one) so ratatui automatically scrolls the viewport to keep the
+    /// cursor visible when there are more files than fit the given `area`
+    /// — a directory (or a multi-drive selection built with `scan_add`)
+    /// with many files no longer gets silently cut off with no way to reach
+    /// the entries past the bottom edge.
     pub fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
         let items: Vec<ListItem> = self
             .files
             .iter()
             .zip(&self.checked)
-            .enumerate()
-            .map(|(i, (p, checked))| {
+            .map(|(p, checked)| {
                 let mark = if *checked { "[x]" } else { "[ ]" };
                 let name = p
                     .file_name()
@@ -139,19 +151,17 @@ impl FileChecklist {
                 } else {
                     name
                 };
-                let style = if focused && i == self.cursor {
-                    Style::default().add_modifier(Modifier::REVERSED)
-                } else {
-                    Style::default()
-                };
-                ListItem::new(format!("{mark} {name}")).style(style)
+                ListItem::new(format!("{mark} {name}"))
             })
             .collect();
         let selected_count = self.checked.iter().filter(|c| **c).count();
         let title = if self.files.is_empty() {
-            "shard files (none found — Enter to (re)scan the directory above)".to_string()
+            "shard files (none found — Enter adds this directory's files)".to_string()
         } else {
-            format!("shard files — Space to toggle ({selected_count} selected)")
+            format!(
+                "shard files — Space toggle, Enter (on dir) adds more, c clears ({selected_count} selected, {} listed)",
+                self.files.len()
+            )
         };
         let border_style = if focused {
             Style::default().fg(theme::ACCENT)
@@ -162,8 +172,58 @@ impl FileChecklist {
             .borders(Borders::ALL)
             .title(title)
             .border_style(border_style);
-        frame.render_widget(List::new(items).block(block), area);
+        // Only mark a row selected (reversed + auto-scrolled to) while this
+        // widget actually has focus, matching the pre-scrolling behavior of
+        // only highlighting the cursor when it's reachable by the keyboard.
+        let mut state = ListState::default();
+        if focused && !self.files.is_empty() {
+            state.select(Some(self.cursor));
+        }
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(block)
+                .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+            area,
+            &mut state,
+        );
     }
+}
+
+/// Scan a directory for `.hx` shard/share files and `.png` QR exports of
+/// one. Shared by [`FileChecklist::rescan`] and [`FileChecklist::scan_add`].
+fn scan_dir(dir: &str) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(std::path::PathBuf::from(dir))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "hx" || e == "png"))
+        .collect()
+}
+
+/// Compute which contiguous slice `[start, end)` of `total` same-height rows
+/// should be rendered so that `focused` stays inside a `capacity`-row
+/// viewport — clamped so the window never runs past either end of the list.
+/// Purely a function of the current focus and capacity (no separate scroll
+/// state to keep in sync): tabbing through a long list of per-guardian rows
+/// naturally scrolls the visible window along with it.
+///
+/// A computed `capacity` of 0 (a terminal too short to fit even the fixed
+/// fields around the scrollable section) is floored to 1 rather than
+/// showing nothing: a cramped single row you can still Tab to and edit
+/// beats a screen that silently hides every guardian field.
+pub fn scroll_window(total: usize, focused: usize, capacity: usize) -> (usize, usize) {
+    if total == 0 {
+        return (0, 0);
+    }
+    let capacity = capacity.max(1);
+    if total <= capacity {
+        return (0, total);
+    }
+    let focused = focused.min(total - 1);
+    let max_start = total - capacity;
+    let start = focused.saturating_sub(capacity - 1).min(max_start);
+    (start, start + capacity)
 }
 
 /// Render the shared audit Block/Warn modal, used identically by the Sign
@@ -271,19 +331,24 @@ mod tests {
     }
 
     #[test]
-    fn file_checklist_rescan_finds_hx_files_and_resets_checks() {
+    fn file_checklist_scan_add_finds_hx_and_png_but_not_other_files() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("shard-1.hx"), b"x").expect("write");
         std::fs::write(dir.path().join("shard-2.hx"), b"x").expect("write");
+        std::fs::write(dir.path().join("qr-export.png"), b"x").expect("write");
         std::fs::write(dir.path().join("notes.txt"), b"x").expect("write");
 
         let mut list = FileChecklist::default();
         list.dir
             .set_value(dir.path().to_string_lossy().into_owned());
-        list.rescan();
+        list.scan_add();
 
-        assert_eq!(list.files.len(), 2);
-        assert!(list.files.iter().all(|p| p.extension().unwrap() == "hx"));
+        assert_eq!(list.files.len(), 3);
+        assert!(
+            list.files
+                .iter()
+                .all(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("hx" | "png")))
+        );
         assert_eq!(list.selected().len(), 0);
 
         list.toggle();
@@ -291,10 +356,67 @@ mod tests {
         list.move_down();
         list.toggle();
         assert_eq!(list.selected().len(), 2);
+    }
 
-        // Re-scanning resets selection state.
-        list.rescan();
-        assert_eq!(list.selected().len(), 0);
+    #[test]
+    fn file_checklist_scan_add_accumulates_across_directories_without_losing_selection() {
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        std::fs::write(dir_a.path().join("shard-1.hx"), b"x").expect("write");
+        std::fs::write(dir_b.path().join("shard-2.hx"), b"x").expect("write");
+
+        let mut list = FileChecklist::default();
+        list.dir
+            .set_value(dir_a.path().to_string_lossy().into_owned());
+        list.scan_add();
+        assert_eq!(list.files.len(), 1);
+        list.toggle(); // check shard-1 from drive A
+
+        // Scanning a second directory (a different guardian's drive) must
+        // add its files without clearing what drive A already contributed.
+        list.dir
+            .set_value(dir_b.path().to_string_lossy().into_owned());
+        list.scan_add();
+        assert_eq!(list.files.len(), 2);
+        assert_eq!(list.selected().len(), 1, "drive A's checkbox must survive");
+
+        // Re-scanning the same directory again must not duplicate entries.
+        list.scan_add();
+        assert_eq!(list.files.len(), 2);
+    }
+
+    #[test]
+    fn file_checklist_clear_empties_the_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("shard-1.hx"), b"x").expect("write");
+        let mut list = FileChecklist::default();
+        list.dir
+            .set_value(dir.path().to_string_lossy().into_owned());
+        list.scan_add();
+        list.toggle();
+        list.clear();
+        assert!(list.files.is_empty());
+        assert!(list.checked.is_empty());
+        assert_eq!(list.cursor, 0);
+    }
+
+    #[test]
+    fn scroll_window_keeps_focused_row_inside_a_small_viewport() {
+        assert_eq!(scroll_window(10, 0, 3), (0, 3));
+        assert_eq!(scroll_window(10, 2, 3), (0, 3));
+        assert_eq!(scroll_window(10, 3, 3), (1, 4));
+        assert_eq!(scroll_window(10, 9, 3), (7, 10));
+        assert_eq!(
+            scroll_window(5, 4, 10),
+            (0, 5),
+            "fits entirely, no windowing"
+        );
+        assert_eq!(scroll_window(0, 0, 3), (0, 0));
+        assert_eq!(
+            scroll_window(10, 5, 0),
+            (5, 6),
+            "a zero capacity (terminal too short for the fixed fields around it) still shows one row"
+        );
     }
 
     #[test]

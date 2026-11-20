@@ -1,0 +1,41 @@
+# VCS / editor / CI
+.git
+.github
+.vscode
+.idea
+
+# Large local/dev artifacts and caches
+target
+.local-devnet
+agent
+site
+web-ui
+data
+tests
+scripts
+demo.sh
+
+# Frontend build artifacts (rebuilt in image)
+web/node_modules
+web/.next
+web/out
+**/node_modules
+**/.next
+**/dist
+
+# Local runtime/state (host-mounted or generated)
+output-shards
+mpc
+qr
+*.log
+horcrux-access.log
+horcrux-wallets.json
+horcrux-ai-events.jsonl
+horcrux-web-state.json
+*.qr-nonce
+
+# Docs not needed for image build
+*.md
+LICENSE
+
+**/.DS_Store

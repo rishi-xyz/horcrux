@@ -1,0 +1,68 @@
+{
+  "wallets": [
+    {
+      "id": "wal-demo-solana",
+      "label": "Demo Solana SSS (2-of-3)",
+      "type": "shard_backed",
+      "chain": "solana",
+      "network": "localnet",
+      "address": "AWH5AsavbwvQZ9NGcpc33pcBc5HCeifYJzXebLEBb5ge",
+      "protected": true,
+      "created_at": 1795200000000,
+      "source": "demo/sss",
+      "shard_refs": [
+        "demo/solana-sss/shard-1.hx",
+        "demo/solana-sss/shard-2.hx",
+        "demo/solana-sss/shard-3.hx"
+      ],
+      "notes": "Demo shard-backed wallet (Horcrux-protected). Shards in /data/demo/solana-sss, password for all shards: demo."
+    },
+    {
+      "id": "wal-demo-solana-mpc",
+      "label": "Demo Solana MPC FROST (2-of-3)",
+      "type": "shard_backed",
+      "chain": "solana",
+      "network": "localnet",
+      "address": "demo-mpc-group (see group.pub / MPC flows)",
+      "protected": true,
+      "created_at": 1795200000050,
+      "source": "demo/mpc-frost",
+      "shard_refs": [
+        "demo/solana-mpc/mpc-1.hx",
+        "demo/solana-mpc/mpc-2.hx",
+        "demo/solana-mpc/mpc-3.hx"
+      ],
+      "group_ref": "demo/solana-mpc/group.pub",
+      "notes": "Demo MPC/FROST shard-backed wallet (Horcrux-protected, Solana/Ed25519). Shares in /data/demo/solana-mpc, password for all shares: demo. Signs without reconstructing the key. Disposable test key: 0x692a3fef7aef0ff579f16c074da756db0cac8486453a28379ac91af19c8d41d4 (demo only)."
+    },
+    {
+      "id": "wal-demo-cosmos",
+      "label": "Demo Cosmos SSS (2-of-3)",
+      "type": "shard_backed",
+      "chain": "cosmos",
+      "network": "local",
+      "address": "cosmos1nhkdhzeesrtvruct6cklf3zayz3qphu4h339gs",
+      "protected": true,
+      "created_at": 1795200000100,
+      "source": "demo/sss",
+      "shard_refs": [
+        "demo/cosmos-sss/shard-1.hx",
+        "demo/cosmos-sss/shard-2.hx",
+        "demo/cosmos-sss/shard-3.hx"
+      ],
+      "notes": "Demo shard-backed wallet (Horcrux-protected). Shards in /data/demo/cosmos-sss, password for all shards: demo."
+    },
+    {
+      "id": "wal-demo-sol-watch",
+      "label": "Demo Solana Watch (local faucet)",
+      "type": "watch_only",
+      "chain": "solana",
+      "network": "localnet",
+      "address": "11111111111111111111111111111111",
+      "protected": false,
+      "created_at": 1795200000200,
+      "source": "demo/watch",
+      "notes": "Demo watch-only address (system program). Not Horcrux-protected."
+    }
+  ]
+}

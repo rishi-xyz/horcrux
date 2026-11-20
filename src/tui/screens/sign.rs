@@ -160,7 +160,14 @@ impl SignScreen {
             _ => match self.focus {
                 Focus::Dir => {
                     if key.code == KeyCode::Enter {
-                        self.picker.rescan();
+                        // Adds this directory's files to whatever is
+                        // already listed, rather than replacing it — so
+                        // shards spread across several guardians' USB
+                        // drives can be selected together by typing each
+                        // drive's path here in turn and pressing Enter
+                        // after each one, instead of being limited to one
+                        // directory (and therefore one guardian) at a time.
+                        self.picker.scan_add();
                         self.sync_passwords();
                     } else {
                         self.picker.dir.handle_key(key);
@@ -173,6 +180,7 @@ impl SignScreen {
                         self.picker.toggle();
                         self.sync_passwords();
                     }
+                    KeyCode::Char('c') | KeyCode::Char('C') => self.picker.clear(),
                     _ => {}
                 },
                 Focus::Password(i) => {
@@ -449,8 +457,26 @@ impl SignScreen {
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         let selected = self.picker.selected();
         let n = selected.len();
-        let mut constraints = vec![Constraint::Length(3), Constraint::Length(6)];
-        constraints.extend(std::iter::repeat_n(Constraint::Length(3), n));
+
+        // Only as many password rows as fit are laid out; scroll_window
+        // picks the window around whichever one is focused, so a selection
+        // spanning more guardians than the terminal has room for scrolls
+        // instead of some of them being rendered off-screen and unreachable.
+        let fixed_rows_height: u16 = 3 + 6 + 1 + 3 + 3 + 3 + 1 + 3; // Dir+Files+scroll hint+To+Lamports+Blockhash+its hint+Broadcast
+        let capacity = (area.height.saturating_sub(fixed_rows_height + 3) / 3) as usize;
+        let focused_index = match self.focus {
+            Focus::Password(i) => i,
+            _ => 0,
+        };
+        let (start, end) = crate::tui::widgets::scroll_window(n, focused_index, capacity);
+        let visible = &selected[start..end];
+
+        let mut constraints = vec![
+            Constraint::Length(3), // Dir
+            Constraint::Length(6), // Files
+            Constraint::Length(1), // scroll hint
+        ];
+        constraints.extend(std::iter::repeat_n(Constraint::Length(3), visible.len()));
         constraints.extend([
             Constraint::Length(3), // To
             Constraint::Length(3), // Lamports
@@ -467,12 +493,26 @@ impl SignScreen {
         self.picker.dir.render(
             frame,
             chunks[0],
-            "shard directory (Enter to scan)",
+            "shard directory (Enter adds its files — repeat per guardian's drive)",
             self.focus == Focus::Dir,
         );
         self.picker
             .render(frame, chunks[1], self.focus == Focus::Files);
-        for (i, path) in selected.iter().enumerate() {
+        let scroll_hint = if n > visible.len() {
+            format!(
+                "password rows {}-{} of {n} — Tab/Shift+Tab to scroll",
+                start + 1,
+                end
+            )
+        } else {
+            String::new()
+        };
+        frame.render_widget(
+            Paragraph::new(scroll_hint).style(Style::default().fg(theme::MUTED)),
+            chunks[2],
+        );
+        for (row_offset, path) in visible.iter().enumerate() {
+            let i = start + row_offset;
             let label = format!(
                 "password for {} (distinct per guardian)",
                 path.file_name()
@@ -482,13 +522,13 @@ impl SignScreen {
             if let Some(field) = self.password_by_path.get(path) {
                 field.render(
                     frame,
-                    chunks[2 + i],
+                    chunks[3 + row_offset],
                     &label,
                     self.focus == Focus::Password(i),
                 );
             }
         }
-        let to_idx = 2 + n;
+        let to_idx = 3 + visible.len();
         self.to.render(
             frame,
             chunks[to_idx],
@@ -609,5 +649,34 @@ fn stage_shard_path(
 fn cleanup_temp_files(paths: &[PathBuf]) {
     for p in paths {
         let _ = std::fs::remove_file(p);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// Many selected shards (more password rows than a small terminal can
+    /// show at once, e.g. combined from several guardians' drives via
+    /// `scan_add`) must scroll instead of panicking or being rendered
+    /// unreachably off-screen.
+    #[test]
+    fn render_with_many_selected_shards_in_a_small_terminal_does_not_panic() {
+        let mut screen = SignScreen::default();
+        for i in 0..20 {
+            screen
+                .picker
+                .files
+                .push(PathBuf::from(format!("shard-{i}.hx")));
+            screen.picker.checked.push(true);
+        }
+
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| screen.render(frame, frame.area()))
+            .expect("draw must not panic");
     }
 }
